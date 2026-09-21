@@ -77,7 +77,7 @@ from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "Admin_settings.json"
-CURRENT_VERSION = "2.5"
+CURRENT_VERSION = "2.6"
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/version.txt"
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/Admin.py"
 READ_PUSH_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/ReadPush.py"
@@ -197,6 +197,7 @@ class AdminApp:
         self.camera: cv2.VideoCapture | None = None
         self.observer: Observer | None = None
         self.threads: list[threading.Thread] = []
+        self.print_lock = threading.Lock()
         self.audio: dict[str, pygame.mixer.Sound] = {}
 
         paths = settings["PATHS"]
@@ -242,7 +243,7 @@ class AdminApp:
         self._start_thread(self.pdf_copy_worker, "PDF copy worker")
         self.start_push_listener()
         print("* Watching Downloads for mpdf.pdf, qwe.pdf and qwez.pdf")
-        print("* Commands: cancel #1234567 | copy #1234567 | help | exit")
+        print("* Commands: print part N | cancel #1234567 | copy #1234567 | help | exit")
         self.console_loop()
 
     def start_push_listener(self) -> None:
@@ -289,9 +290,19 @@ class AdminApp:
             self.stop_event.set()
             return
         if command.casefold() == "help":
+            print("print part N     - print today's order PDF Part N")
             print("cancel #1234567  - mark an order Cancelled")
             print("copy #1234567    - copy matching photos to Desktop")
             print("exit             - stop Admin")
+            return
+
+        print_match = re.fullmatch(r"print\s+part\s+(\d+)", command, re.IGNORECASE)
+        if print_match:
+            part_number = int(print_match.group(1))
+            if part_number < 1:
+                print("! Part number must be 1 or greater")
+                return
+            self.print_part_manual(part_number)
             return
 
         match = re.fullmatch(r"(cancel|copy)\s+#?(\d+)", command, re.IGNORECASE)
@@ -304,6 +315,19 @@ class AdminApp:
             self.cancel_order_greenpo_manual(order_id)
         else:
             self.copy_photo_from_network(order_id)
+
+    def print_part_manual(self, part_number: int) -> None:
+        today = datetime.now().strftime("%d.%m.%Y")
+        pdf_path = self.downloads / f"{today} Part {part_number}.pdf"
+        if not pdf_path.is_file():
+            print(f"! Today's order PDF was not found: {pdf_path.name}")
+            return
+
+        print(f"* Print job accepted: {pdf_path.name}")
+        self._start_thread(
+            lambda: self.process_order_pdf(pdf_path),
+            f"print Part {part_number}",
+        )
 
     def copy_with_retry(self, file_path: Path) -> None:
         network_folder = Path(self.settings["NETWORK"]["downloads"])
@@ -513,16 +537,17 @@ class AdminApp:
                 progress.update(task, advance=1)
 
     def process_order_pdf(self, pdf_path: Path) -> None:
-        print(f"* Processing orders: {pdf_path.name}")
-        orders, _ = self.extract_order_numbers(pdf_path)
-        if not orders:
-            print("! No order numbers found")
-            return
-        print(f"* Orders found: {len(orders)}")
-        try:
-            self.print_orders_chunks(orders)
-        except Exception as error:
-            print(f"! Printing failed: {error}")
+        with self.print_lock:
+            print(f"* Processing orders: {pdf_path.name}")
+            orders, _ = self.extract_order_numbers(pdf_path)
+            if not orders:
+                print("! No order numbers found")
+                return
+            print(f"* Orders found: {len(orders)}")
+            try:
+                self.print_orders_chunks(orders)
+            except Exception as error:
+                print(f"! Printing failed: {error}")
 
     @staticmethod
     def normalize_scan(data: str) -> str:
@@ -818,7 +843,8 @@ class PDFHandler(FileSystemEventHandler):
             try:
                 if name == "mpdf.pdf":
                     renamed = self.rename_order_pdf(file_path)
-                    self.app.process_order_pdf(renamed)
+                    part_number = renamed.stem.rsplit(" ", 1)[-1]
+                    print(f"* Printing is waiting for command: print part {part_number}")
                 elif name == "qwe.pdf":
                     self.rename_label_pdf(file_path)
                 else:
