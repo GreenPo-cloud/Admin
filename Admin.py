@@ -77,7 +77,7 @@ from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "Admin_settings.json"
-CURRENT_VERSION = "2.6"
+CURRENT_VERSION = "2.7"
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/version.txt"
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/Admin.py"
 READ_PUSH_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/ReadPush.py"
@@ -243,7 +243,7 @@ class AdminApp:
         self._start_thread(self.pdf_copy_worker, "PDF copy worker")
         self.start_push_listener()
         print("* Watching Downloads for mpdf.pdf, qwe.pdf and qwez.pdf")
-        print("* Commands: print part N | cancel #1234567 | copy #1234567 | help | exit")
+        print("* Commands: print part N | send part N | cancel #1234567 | copy #1234567 | help | exit")
         self.console_loop()
 
     def start_push_listener(self) -> None:
@@ -291,6 +291,7 @@ class AdminApp:
             return
         if command.casefold() == "help":
             print("print part N     - print today's order PDF Part N")
+            print("send part N      - send today's Label PDF Part N")
             print("cancel #1234567  - mark an order Cancelled")
             print("copy #1234567    - copy matching photos to Desktop")
             print("exit             - stop Admin")
@@ -303,6 +304,15 @@ class AdminApp:
                 print("! Part number must be 1 or greater")
                 return
             self.print_part_manual(part_number)
+            return
+
+        send_match = re.fullmatch(r"send\s+part\s+(\d+)", command, re.IGNORECASE)
+        if send_match:
+            part_number = int(send_match.group(1))
+            if part_number < 1:
+                print("! Part number must be 1 or greater")
+                return
+            self.send_label_part_manual(part_number)
             return
 
         match = re.fullmatch(r"(cancel|copy)\s+#?(\d+)", command, re.IGNORECASE)
@@ -329,6 +339,16 @@ class AdminApp:
             f"print Part {part_number}",
         )
 
+    def send_label_part_manual(self, part_number: int) -> None:
+        today = datetime.now().strftime("%d.%m.%Y")
+        label_path = self.downloads / f"{today} Part {part_number} (Label).pdf"
+        if not label_path.is_file():
+            print(f"! Today's Label PDF was not found: {label_path.name}")
+            return
+
+        self.send_pdf(label_path)
+        print(f"* Label send job accepted: {label_path.name}")
+
     def copy_with_retry(self, file_path: Path) -> None:
         network_folder = Path(self.settings["NETWORK"]["downloads"])
         destination = network_folder / file_path.name
@@ -338,12 +358,11 @@ class AdminApp:
                 print(f"* Copied to second computer: {destination}")
                 return
             except Exception as error:
-                print(f"! Copy failed: {error}; retrying in 15 seconds")
-                self.stop_event.wait(15)
+                print(f"! Copy failed: {error}; retrying in 5 seconds")
+                self.stop_event.wait(5)
 
     def send_pdf(self, file_path: Path) -> None:
-        # One worker preserves update order when qwe.pdf is immediately followed
-        # by qwez.pdf. Parallel copies could otherwise restore an older remote PDF.
+        # One worker preserves the order of PDF copy requests.
         self.pdf_copy_jobs.put(file_path)
 
     def pdf_copy_worker(self) -> None:
@@ -872,7 +891,7 @@ class PDFHandler(FileSystemEventHandler):
             raise FileNotFoundError("Today's order PDF was not found")
         os.replace(source, destination)
         print(f"* Label PDF renamed: {destination.name}")
-        self.app.send_pdf(destination)
+        print(f"* Sending is waiting for command: send part {destination.stem.split(' Part ')[-1].split(' ')[0]}")
         return destination
 
     def append_label_fragment(self, fragment: Path) -> Path:
@@ -895,7 +914,7 @@ class PDFHandler(FileSystemEventHandler):
             if temporary.exists():
                 temporary.unlink()
         print(f"* Label fragment appended: {destination.name}")
-        self.app.send_pdf(destination)
+        print(f"* Sending is waiting for command: send part {destination.stem.split(' Part ')[-1].split(' ')[0]}")
         return destination
 
 
