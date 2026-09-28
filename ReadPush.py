@@ -1,8 +1,8 @@
-"""Optional reader for Slack notifications stored by Windows.
+"""Windows notification reader used by Admin.py.
 
-Admin.py imports this module only when the file is present.  It does not use a
-Slack token, modify notifications or dismiss them.  Removing ReadPush.py is
-enough to disable the feature; Admin.py will continue to run normally.
+Slack does not expose application metadata on the target computer, so the
+listener prints the sender/title and message from every new Windows toast. It
+does not connect to Slack, modify notifications or dismiss them.
 """
 
 from __future__ import annotations
@@ -13,11 +13,10 @@ import subprocess
 import sys
 import threading
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 
-POLL_INTERVAL_SECONDS = 1.0
-SLACK_NAME_FRAGMENT = "slack"
+POLL_INTERVAL_SECONDS = 0.5
 
 
 def _console_marker() -> str:
@@ -26,12 +25,11 @@ def _console_marker() -> str:
         marker.encode(sys.stdout.encoding or "utf-8")
         return marker
     except UnicodeEncodeError:
-        # Some older Windows consoles use cp1251. ANSI gives them a cyan dot
-        # without allowing an unsupported emoji to stop the listener.
         return "\033[96m●\033[0m" if sys.stdout.isatty() else "[PUSH]"
 
 
 BLUE_MARKER = _console_marker()
+OTHER_MARKER = "[PUSH]"
 
 WINRT_PACKAGES = (
     "winrt-Windows.Foundation",
@@ -70,60 +68,177 @@ def _load_winrt_types():
 
 
 def _enum_member(enum_type: Any, name: str) -> Any:
-    """Support both the current uppercase and older lowercase PyWinRT enums."""
+    """Support both current uppercase and older lowercase PyWinRT enums."""
     for candidate in (name, name.lower()):
         if hasattr(enum_type, candidate):
             return getattr(enum_type, candidate)
     raise AttributeError(f"{enum_type.__name__}.{name} is unavailable")
 
 
-def _app_name(notification: Any) -> str:
+def _safe_attr(value: Any, attribute: str, default: Any = None) -> Any:
     try:
-        return str(notification.app_info.display_info.display_name).strip()
+        result = getattr(value, attribute)
+        return default if result is None else result
     except Exception:
-        return ""
+        return default
 
 
-def _text_fields(notification: Any, toast_generic: Any) -> list[str]:
+def _safe_text(value: Any, default: str = "not available") -> str:
+    if value is None:
+        return default
     try:
-        binding = notification.notification.visual.get_binding(toast_generic)
-        if binding is None:
-            return []
-        return [
-            str(element.text).strip()
-            for element in binding.get_text_elements()
-            if str(element.text).strip()
-        ]
+        text = str(value).strip()
+        return text or default
     except Exception:
-        return []
+        return default
 
 
-def _creation_time(notification: Any) -> str:
+def _format_time(value: Any) -> str:
+    if value is None:
+        return "not available"
     try:
-        value = notification.creation_time
         if isinstance(value, datetime):
-            return value.astimezone().strftime("%d.%m.%Y %H:%M:%S")
+            return value.astimezone().strftime("%d.%m.%Y %H:%M:%S.%f")[:-3]
         return str(value)
     except Exception:
-        return "unknown"
+        return "not available"
 
 
-def _notification_key(notification: Any, app_name: str) -> tuple[str, int, str]:
-    return (app_name.casefold(), int(notification.id), _creation_time(notification))
+def _app_metadata(notification: Any) -> dict[str, str]:
+    app_info = _safe_attr(notification, "app_info")
+    display_info = _safe_attr(app_info, "display_info")
+    package = _safe_attr(app_info, "package")
+    package_id = _safe_attr(package, "id")
+    return {
+        "display_name": _safe_text(_safe_attr(display_info, "display_name")),
+        "description": _safe_text(_safe_attr(display_info, "description")),
+        "app_user_model_id": _safe_text(_safe_attr(app_info, "app_user_model_id")),
+        "app_id": _safe_text(_safe_attr(app_info, "id")),
+        "package_family_name": _safe_text(
+            _safe_attr(app_info, "package_family_name")
+        ),
+        "package_name": _safe_text(_safe_attr(package_id, "name")),
+        "package_full_name": _safe_text(_safe_attr(package_id, "full_name")),
+    }
 
 
-def _print_slack_notification(notification: Any, app_name: str, toast_generic: Any) -> None:
-    texts = _text_fields(notification, toast_generic)
-    sender = texts[0] if texts else "not available"
-    message = " | ".join(texts[1:]) if len(texts) > 1 else "not available"
+def _binding_details(notification: Any, toast_generic: Any) -> list[dict[str, Any]]:
+    content = _safe_attr(notification, "notification")
+    visual = _safe_attr(content, "visual")
+    bindings: list[Any] = []
+    try:
+        bindings = list(visual.bindings)
+    except Exception:
+        pass
+
+    # Some providers expose ToastGeneric through GetBinding but do not enumerate
+    # it reliably through Bindings. Include that fallback without duplicating it.
+    if not bindings and visual is not None:
+        try:
+            generic = visual.get_binding(toast_generic)
+            if generic is not None:
+                bindings.append(generic)
+        except Exception:
+            pass
+
+    result: list[dict[str, Any]] = []
+    for binding in bindings:
+        texts: list[str] = []
+        try:
+            texts = [_safe_text(item.text, "") for item in binding.get_text_elements()]
+            texts = [text for text in texts if text]
+        except Exception as error:
+            texts = [f"<text extraction error: {error}>"]
+        result.append(
+            {
+                "template": _safe_text(_safe_attr(binding, "template")),
+                "language": _safe_text(_safe_attr(binding, "language")),
+                "texts": texts,
+            }
+        )
+    return result
+
+
+def _notification_record(notification: Any, toast_generic: Any) -> dict[str, Any]:
+    app = _app_metadata(notification)
+    content = _safe_attr(notification, "notification")
+    visual = _safe_attr(content, "visual")
+    return {
+        "id": int(_safe_attr(notification, "id", -1)),
+        "creation_time": _format_time(_safe_attr(notification, "creation_time")),
+        "expiration_time": _format_time(_safe_attr(content, "expiration_time")),
+        "visual_language": _safe_text(_safe_attr(visual, "language")),
+        "app": app,
+        "bindings": _binding_details(notification, toast_generic),
+    }
+
+
+def _all_texts(record: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        text
+        for binding in record["bindings"]
+        for text in binding["texts"]
+    )
+
+
+def _identity(record: dict[str, Any]) -> tuple[str, int]:
+    app = record["app"]
+    app_identity = next(
+        (
+            value
+            for value in (
+                app["app_user_model_id"],
+                app["package_family_name"],
+                app["app_id"],
+                app["display_name"],
+            )
+            if value != "not available"
+        ),
+        "unknown application",
+    )
+    return app_identity, record["id"]
+
+
+def _fingerprint(record: dict[str, Any]) -> tuple[Any, ...]:
+    """Include content so an updated Slack toast is treated as a new event."""
+    binding_values = tuple(
+        (binding["template"], binding["language"], tuple(binding["texts"]))
+        for binding in record["bindings"]
+    )
+    return (
+        record["creation_time"],
+        record["expiration_time"],
+        record["visual_language"],
+        binding_values,
+    )
+
+
+def _notification_fields(record: dict[str, Any]) -> tuple[str, str] | None:
+    texts = _all_texts(record)
+    if not texts:
+        return None
+    sender = texts[0]
+    message = " | ".join(texts[1:])
+    return sender, message
+
+
+def _print_notification(sender: str, message: str) -> None:
     print()
-    print(f"{BLUE_MARKER} SLACK PUSH")
-    print(f"  App: {app_name or 'Slack'}")
-    print(f"  Sender/title: {sender}")
-    print(f"  Message: {message}")
-    print(f"  Time: {_creation_time(notification)}")
-    print(f"  Windows notification ID: {notification.id}")
+    print(f"{BLUE_MARKER} {sender}: {message}" if message else f"{BLUE_MARKER} {sender}")
     print("> ", end="", flush=True)
+
+
+def _snapshot(
+    notifications: Any, toast_generic: Any
+) -> dict[tuple[str, int], dict[str, Any]]:
+    snapshot: dict[tuple[str, int], dict[str, Any]] = {}
+    for notification in notifications:
+        try:
+            record = _notification_record(notification, toast_generic)
+            snapshot[_identity(record)] = record
+        except Exception as error:
+            print(f"{OTHER_MARKER} Cannot decode one Windows notification: {error}")
+    return snapshot
 
 
 async def _request_access(listener: Any, allowed_status: Any) -> bool:
@@ -134,21 +249,21 @@ async def _request_access(listener: Any, allowed_status: Any) -> bool:
         status = await listener.request_access_async()
         if status == allowed_status:
             return True
-        print(
-            f"{BLUE_MARKER} Slack push listener has no Windows permission "
-            f"(status: {status})."
-        )
+        print(f"{BLUE_MARKER} Notification access was not allowed")
         return False
     except Exception as error:
         print(
-            f"{BLUE_MARKER} Slack push listener cannot request Windows access: {error}. "
-            "This Windows configuration may block notification access for an "
-            "unpackaged Python program."
+            f"{BLUE_MARKER} Cannot request Windows notification access: {error}. "
+            "This Windows configuration may block an unpackaged Python program."
         )
         return False
 
 
-async def _listen(stop_event: threading.Event) -> None:
+async def _listen(
+    stop_event: threading.Event,
+    notification_filter: Callable[[str], bool] | None,
+    on_notification: Callable[[str, str], None] | None,
+) -> None:
     (
         UserNotificationListener,
         UserNotificationListenerAccessStatus,
@@ -163,53 +278,51 @@ async def _listen(stop_event: threading.Event) -> None:
     if not await _request_access(listener, allowed):
         return
 
-    # Build a baseline so old entries still present in Action Center are not
-    # printed as if they arrived after Admin started.
-    initial = await listener.get_notifications_async(toast)
-    seen = {
-        _notification_key(item, _app_name(item))
-        for item in initial
-        if SLACK_NAME_FRAGMENT in _app_name(item).casefold()
-    }
-    print(
-        f"{BLUE_MARKER} Slack push listener started "
-        f"({len(seen)} existing notification(s) ignored)"
-    )
+    initial_items = await listener.get_notifications_async(toast)
+    known = _snapshot(initial_items, toast_generic)
+    print(f"{BLUE_MARKER} Windows notification listener started")
 
     consecutive_errors = 0
     while not stop_event.is_set():
         try:
-            current = await listener.get_notifications_async(toast)
-            for notification in current:
-                app_name = _app_name(notification)
-                if SLACK_NAME_FRAGMENT not in app_name.casefold():
-                    continue
-                key = _notification_key(notification, app_name)
-                if key in seen:
-                    continue
-                seen.add(key)
-                _print_slack_notification(notification, app_name, toast_generic)
+            current_items = await listener.get_notifications_async(toast)
+            current = _snapshot(current_items, toast_generic)
 
-            # Prevent an indefinitely growing set while retaining enough history
-            # to avoid duplicates when Action Center is opened or refreshed.
-            if len(seen) > 5000:
-                live_keys = {
-                    _notification_key(item, _app_name(item))
-                    for item in current
-                    if SLACK_NAME_FRAGMENT in _app_name(item).casefold()
-                }
-                seen = live_keys
+            for identity, record in current.items():
+                previous = known.get(identity)
+                if previous is None or _fingerprint(previous) != _fingerprint(record):
+                    fields = _notification_fields(record)
+                    if fields is None:
+                        continue
+                    sender, message = fields
+                    if notification_filter is not None:
+                        try:
+                            if not notification_filter(sender):
+                                continue
+                        except Exception as error:
+                            print(f"{OTHER_MARKER} Notification filter failed: {error}")
+                            continue
+                    _print_notification(sender, message)
+                    if on_notification is not None:
+                        try:
+                            on_notification(sender, message)
+                        except Exception as error:
+                            print(f"{OTHER_MARKER} Notification callback failed: {error}")
+
+            # Keeping only the current snapshot lets an identical notification be
+            # detected again after it is dismissed and later recreated.
+            known = current
             consecutive_errors = 0
         except Exception as error:
             consecutive_errors += 1
             print(
-                f"{BLUE_MARKER} Slack push read error: {error} "
+                f"{BLUE_MARKER} Windows push read error: {error} "
                 f"(attempt {consecutive_errors}/3)"
             )
             if consecutive_errors >= 3:
                 print(
-                    f"{BLUE_MARKER} Slack push listener disabled after repeated "
-                    "Windows API errors; the rest of Admin remains active"
+                    f"{BLUE_MARKER} Push listener disabled after repeated Windows "
+                    "API errors; the rest of Admin remains active"
                 )
                 return
             await asyncio.sleep(5)
@@ -217,19 +330,23 @@ async def _listen(stop_event: threading.Event) -> None:
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
-def _thread_main(stop_event: threading.Event) -> None:
+def _thread_main(
+    stop_event: threading.Event,
+    notification_filter: Callable[[str], bool] | None,
+    on_notification: Callable[[str, str], None] | None,
+) -> None:
     try:
-        asyncio.run(_listen(stop_event))
+        asyncio.run(_listen(stop_event, notification_filter, on_notification))
     except Exception as error:
-        print(f"{BLUE_MARKER} Slack push listener stopped: {error}")
+        print(f"{BLUE_MARKER} Windows push listener stopped: {error}")
 
 
 def start_slack_notification_listener(
     stop_event: threading.Event,
+    notification_filter: Callable[[str], bool] | None = None,
+    on_notification: Callable[[str, str], None] | None = None,
 ) -> threading.Thread | None:
-    """Start listening in a daemon thread and return that thread."""
-    # Microsoft requires the permission request on the caller's UI/main thread.
-    # Admin invokes this function from its main console thread before input starts.
+    """Request access on the main thread, then start the diagnostic listener."""
     (
         UserNotificationListener,
         UserNotificationListenerAccessStatus,
@@ -243,8 +360,8 @@ def start_slack_notification_listener(
 
     thread = threading.Thread(
         target=_thread_main,
-        args=(stop_event,),
-        name="Slack push listener",
+        args=(stop_event, notification_filter, on_notification),
+        name="Windows notification listener",
         daemon=True,
     )
     thread.start()

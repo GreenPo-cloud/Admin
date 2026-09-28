@@ -77,7 +77,7 @@ from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "Admin_settings.json"
-CURRENT_VERSION = "2.7"
+CURRENT_VERSION = "3.0"
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/version.txt"
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/Admin.py"
 READ_PUSH_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/ReadPush.py"
@@ -159,20 +159,22 @@ class ConsoleInput:
     def __init__(self, stop_event: threading.Event):
         self.stop_event = stop_event
         self._lock = threading.Lock()
+        self._ask_lock = threading.Lock()
         self._request: tuple[threading.Event, list[str]] | None = None
 
     def ask(self, prompt: str) -> str | None:
-        completed = threading.Event()
-        answer: list[str] = []
-        with self._lock:
-            if self._request is not None:
-                raise RuntimeError("Another console question is already active")
-            self._request = (completed, answer)
-        print(f"\n{prompt}")
-        while not self.stop_event.is_set():
-            if completed.wait(0.25):
-                return answer[0]
-        return None
+        # Printing and notification confirmation can both ask questions. Keep
+        # them sequential so an incoming cancel request is never dropped.
+        with self._ask_lock:
+            completed = threading.Event()
+            answer: list[str] = []
+            with self._lock:
+                self._request = (completed, answer)
+            print(f"\n{prompt}")
+            while not self.stop_event.is_set():
+                if completed.wait(0.25):
+                    return answer[0]
+            return None
 
     def accept_pending_answer(self, text: str) -> bool:
         with self._lock:
@@ -193,11 +195,13 @@ class AdminApp:
         self.console_input = ConsoleInput(self.stop_event)
         self.photo_jobs: queue.Queue[tuple[str, str]] = queue.Queue()
         self.pdf_copy_jobs: queue.Queue[Path] = queue.Queue()
+        self.notification_jobs: queue.Queue[tuple[str, str]] = queue.Queue()
         self.serial_connection: serial.Serial | None = None
         self.camera: cv2.VideoCapture | None = None
         self.observer: Observer | None = None
         self.threads: list[threading.Thread] = []
         self.print_lock = threading.Lock()
+        self.statistics_lock = threading.Lock()
         self.audio: dict[str, pygame.mixer.Sound] = {}
 
         paths = settings["PATHS"]
@@ -241,6 +245,7 @@ class AdminApp:
         self._start_thread(self.com_listener, "COM listener")
         self._start_thread(self.camera_worker, "camera worker")
         self._start_thread(self.pdf_copy_worker, "PDF copy worker")
+        self._start_thread(self.notification_command_worker, "notification command worker")
         self.start_push_listener()
         print("* Watching Downloads for mpdf.pdf, qwe.pdf and qwez.pdf")
         print("* Commands: print part N | send part N | cancel #1234567 | copy #1234567 | help | exit")
@@ -261,7 +266,11 @@ class AdminApp:
             return
 
         try:
-            thread = start_slack_notification_listener(self.stop_event)
+            thread = start_slack_notification_listener(
+                self.stop_event,
+                notification_filter=self.notification_sender_allowed,
+                on_notification=self.enqueue_notification,
+            )
             if thread is not None:
                 self.threads.append(thread)
         except Exception as error:
@@ -271,6 +280,93 @@ class AdminApp:
         thread = threading.Thread(target=target, name=name, daemon=True)
         thread.start()
         self.threads.append(thread)
+
+    @staticmethod
+    def normalize_sender(sender: str) -> str:
+        return " ".join(sender.split()).casefold()
+
+    def notification_sender_allowed(self, sender: str) -> bool:
+        """Return whether a Windows notification sender is configured."""
+        configuration = self.settings.get("NOTIFICATION_BOT", {})
+        if not configuration.get("enabled", False):
+            return False
+        allowed_senders = {
+            self.normalize_sender(str(name))
+            for name in configuration.get("allowed_senders", [])
+        }
+        return self.normalize_sender(sender) in allowed_senders
+
+    def enqueue_notification(self, sender: str, message: str) -> None:
+        self.notification_jobs.put((sender, message))
+
+    def parse_cancel_notification(self, message: str) -> list[str]:
+        """Return unique order IDs only for an unambiguous cancel request."""
+        configuration = self.settings.get("NOTIFICATION_BOT", {})
+        threshold = float(configuration.get("cancel_similarity_threshold", 82))
+        words = re.findall(r"[a-z]+(?:'[a-z]+)?", message.casefold())
+        cancel_found = any(fuzz.ratio(word, "cancel") >= threshold for word in words)
+        if not cancel_found:
+            return []
+
+        # Fail closed: phrases containing a negation are not automatic commands.
+        negations = {"not", "never", "dont", "don't", "cannot", "cant", "can't"}
+        if any(word in negations for word in words):
+            print("! Cancel request ignored because it contains a negation")
+            return []
+
+        order_ids: list[str] = []
+        seen: set[str] = set()
+        for number in re.findall(r"(?<!\d)#?(\d{5,})(?!\d)", message):
+            order_id = f"#{number}"
+            if order_id not in seen:
+                seen.add(order_id)
+                order_ids.append(order_id)
+        if not order_ids:
+            print("! Cancel request contains no order number with at least 5 digits")
+        return order_ids
+
+    def notification_command_worker(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                sender, message = self.notification_jobs.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                order_ids = self.parse_cancel_notification(message)
+                if not order_ids:
+                    continue
+
+                formatted_orders = ", ".join(order_ids)
+                configuration = self.settings.get("NOTIFICATION_BOT", {})
+                mode = str(configuration.get("mode", "confirm")).casefold()
+                if mode == "confirm":
+                    while not self.stop_event.is_set():
+                        answer = self.console_input.ask(
+                            f"Cancel {formatted_orders} requested by {sender}? Enter y or n:"
+                        )
+                        if answer is None:
+                            return
+                        normalized_answer = answer.strip().casefold()
+                        if normalized_answer in {"y", "yes"}:
+                            break
+                        if normalized_answer in {"n", "no"}:
+                            print(f"* Cancel request rejected: {formatted_orders}")
+                            order_ids = []
+                            break
+                        print("! Please enter y (yes) or n (no)")
+                elif mode != "auto":
+                    print(
+                        f"! Unknown NOTIFICATION_BOT mode '{mode}'; "
+                        "use 'confirm' or 'auto'"
+                    )
+                    continue
+
+                for order_id in order_ids:
+                    self.cancel_order_greenpo_manual(order_id)
+            except Exception as error:
+                print(f"! Cannot process notification command: {error}")
+            finally:
+                self.notification_jobs.task_done()
 
     def console_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -444,18 +540,67 @@ class AdminApp:
             return False
 
     def cancel_order_greenpo_manual(self, order_id: str) -> bool:
-        status = self.get_greenpo_order_status(order_id)
-        if not self.update_greenpo_statistics(order_id):
-            print(f"! Active order not found: {order_id}")
+        stat_file = self.statistics_path()
+        if not stat_file.exists():
+            print(f"! Today's statistics file was not found: {stat_file}")
             return False
-        if status in {"completed", "completed_cancelled"}:
-            print(f"! COMPLETED ORDER CANCELLED: {order_id}")
-            print("! Find this order among completed orders")
-        elif status == "cancelled":
-            print(f"* Order was already cancelled: {order_id}")
-        else:
-            print(f"* ORDER CANCELLED: {order_id}")
-        return True
+
+        with self.statistics_lock:
+            try:
+                lines = stat_file.read_text(encoding="utf-8").splitlines(keepends=True)
+                order_pattern = re.compile(rf"^{re.escape(order_id)}(?=\D|$)")
+                for line_number, line in enumerate(lines, start=1):
+                    stripped = line.rstrip("\r\n")
+                    if not order_pattern.match(stripped):
+                        continue
+
+                    already_cancelled = "Cancelled" in stripped
+                    assembled = "+" in stripped
+                    packed = False
+                    if assembled:
+                        after_plus = stripped.split("+", 1)[1].strip()
+                        after_plus = after_plus.lstrip(")]}:;- ").strip()
+                        after_plus = re.sub(
+                            r"(?:^|\s+)Cancelled\s*$",
+                            "",
+                            after_plus,
+                            flags=re.IGNORECASE,
+                        ).strip()
+                        packed = bool(after_plus)
+
+                    if not already_cancelled:
+                        newline = (
+                            "\r\n"
+                            if line.endswith("\r\n")
+                            else "\n" if line.endswith("\n") else ""
+                        )
+                        lines[line_number - 1] = f"{stripped} Cancelled{newline}"
+                        stat_file.write_text("".join(lines), encoding="utf-8")
+                        print(f"* ORDER CANCELLED: {order_id} (line {line_number})")
+                    else:
+                        print(
+                            f"* Order was already cancelled: {order_id} "
+                            f"(line {line_number})"
+                        )
+
+                    warning_console = Console()
+                    if assembled:
+                        warning_console.print(
+                            f"[bold yellow]! Заказ {order_id} уже собран! "
+                            f"Строка: {line_number}[/]"
+                        )
+                    if packed:
+                        warning_console.print(
+                            f"[bold yellow]! Он уже упакован! "
+                            f"Заказ {order_id}, строка: {line_number}[/]"
+                        )
+                    return True
+            except Exception as error:
+                print(f"! Cannot cancel {order_id}: {error}")
+                return False
+
+        print(f"! Active order not found: {order_id}")
+        return False
 
     def extract_order_numbers(self, pdf_path: Path) -> tuple[list[list], bool]:
         delivery_groups = {"UPS": [], "Zasilkovna": [], "Postal": []}
