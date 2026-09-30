@@ -37,6 +37,7 @@ REQUIRED_PACKAGES = [
     ("cv2", "opencv-python"),
     ("dymo_sdk", "dymo-sdk"),
     ("pdfplumber", "pdfplumber"),
+    ("playwright", "playwright"),
     ("pypdf", "pypdf"),
     ("pygame", "pygame"),
     ("pygrabber", "pygrabber"),
@@ -77,11 +78,17 @@ from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "Admin_settings.json"
-CURRENT_VERSION = "3.0"
+CURRENT_VERSION = "3.1"
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/version.txt"
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/Admin.py"
 READ_PUSH_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/ReadPush.py"
+FINISH_ORDERS_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/FinishOrders.py"
 MUTEX_NAME = "GreenPoAdminProgramMutex"
+
+COMPANION_FILES = {
+    "ReadPush.py": READ_PUSH_URL,
+    "FinishOrders.py": FINISH_ORDERS_URL,
+}
 
 
 def version_key(value: str) -> tuple[int, ...] | None:
@@ -109,6 +116,30 @@ def configured_path(value: str) -> Path:
     return path if path.is_absolute() else BASE_DIR / path
 
 
+def ensure_finish_orders_settings(path: Path = SETTINGS_PATH) -> None:
+    """Add the local-only FinishOrders settings after the first code update."""
+    try:
+        settings = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"! Cannot prepare FINISH_ORDERS settings: {error}")
+        return
+
+    if isinstance(settings.get("FINISH_ORDERS"), dict):
+        return
+
+    settings["FINISH_ORDERS"] = {
+        "site_url": "",
+        "browser_channel": "chrome",
+        "browser_profile": "BrowserProfile",
+        "logs_folder": "~/Desktop/FinishOrdersLogs",
+    }
+    path.write_text(
+        json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print("* Added FINISH_ORDERS section to Admin_settings.json")
+
+
 def check_for_updates() -> None:
     """Check once at startup and install only a strictly newer version."""
     try:
@@ -127,23 +158,60 @@ def check_for_updates() -> None:
         print(f"! Update check failed: {error}")
 
 
-def update_program() -> None:
-    response = requests.get(PYTHON_URL, timeout=15)
+def download_file(url: str, destination: Path, *, timeout: int = 15) -> None:
+    """Download one program file and replace it only after a complete response."""
+    response = requests.get(url, timeout=timeout)
     response.raise_for_status()
-    read_push_response = requests.get(READ_PUSH_URL, timeout=15)
-    read_push_response.raise_for_status()
+    temporary = destination.with_name(f"{destination.name}.download")
+    try:
+        temporary.write_bytes(response.content)
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def ensure_companion_files() -> None:
+    """Install optional program files that were added after an Admin update."""
+    for filename, url in COMPANION_FILES.items():
+        destination = BASE_DIR / filename
+        if destination.is_file():
+            continue
+        try:
+            download_file(url, destination)
+            print(f"* Installed missing companion file: {filename}")
+        except Exception as error:
+            print(f"! Cannot install {filename}: {error}")
+
+
+def update_program() -> None:
+    downloads = {
+        "Admin.py": requests.get(PYTHON_URL, timeout=15),
+        **{
+            filename: requests.get(url, timeout=15)
+            for filename, url in COMPANION_FILES.items()
+        },
+    }
+    for response in downloads.values():
+        response.raise_for_status()
+
     current_file = Path(__file__).resolve()
-    temporary_file = current_file.with_suffix(".py.new")
-    read_push_file = current_file.with_name("ReadPush.py")
-    temporary_read_push = read_push_file.with_suffix(".py.new")
     batch_file = current_file.with_suffix(".update.bat")
-    temporary_file.write_text(response.text, encoding="utf-8")
-    temporary_read_push.write_text(read_push_response.text, encoding="utf-8")
+    replacements: list[tuple[Path, Path]] = []
+    for filename, response in downloads.items():
+        destination = current_file.with_name(filename)
+        temporary = destination.with_name(f"{destination.name}.new")
+        temporary.write_bytes(response.content)
+        replacements.append((temporary, destination))
+
+    move_commands = "".join(
+        f'move /Y "{temporary}" "{destination}" >nul\n'
+        for temporary, destination in replacements
+    )
     batch_file.write_text(
         "@echo off\n"
         "timeout /t 2 >nul\n"
-        f'move /Y "{temporary_file}" "{current_file}" >nul\n'
-        f'move /Y "{temporary_read_push}" "{read_push_file}" >nul\n'
+        f"{move_commands}"
         f'start "" "{sys.executable}" "{current_file}"\n'
         'del "%~f0"\n',
         encoding="utf-8",
@@ -203,6 +271,7 @@ class AdminApp:
         self.print_lock = threading.Lock()
         self.statistics_lock = threading.Lock()
         self.audio: dict[str, pygame.mixer.Sound] = {}
+        self.finish_orders_process: subprocess.Popen | None = None
 
         paths = settings["PATHS"]
         self.desktop = Path.home() / "Desktop"
@@ -248,7 +317,7 @@ class AdminApp:
         self._start_thread(self.notification_command_worker, "notification command worker")
         self.start_push_listener()
         print("* Watching Downloads for mpdf.pdf, qwe.pdf and qwez.pdf")
-        print("* Commands: print part N | send part N | cancel #1234567 | copy #1234567 | help | exit")
+        print("* Commands: print part N | send part N | finish part N | cancel #1234567 | copy #1234567 | help | exit")
         self.console_loop()
 
     def start_push_listener(self) -> None:
@@ -388,6 +457,7 @@ class AdminApp:
         if command.casefold() == "help":
             print("print part N     - print today's order PDF Part N")
             print("send part N      - send today's Label PDF Part N")
+            print("finish part N    - open the order-finishing website for Part N")
             print("cancel #1234567  - mark an order Cancelled")
             print("copy #1234567    - copy matching photos to Desktop")
             print("exit             - stop Admin")
@@ -409,6 +479,17 @@ class AdminApp:
                 print("! Part number must be 1 or greater")
                 return
             self.send_label_part_manual(part_number)
+            return
+
+        finish_match = re.fullmatch(
+            r"finish\s+part\s+(\d+)", command, re.IGNORECASE
+        )
+        if finish_match:
+            part_number = int(finish_match.group(1))
+            if part_number < 1:
+                print("! Part number must be 1 or greater")
+                return
+            self.finish_part_manual(part_number)
             return
 
         match = re.fullmatch(r"(cancel|copy)\s+#?(\d+)", command, re.IGNORECASE)
@@ -444,6 +525,36 @@ class AdminApp:
 
         self.send_pdf(label_path)
         print(f"* Label send job accepted: {label_path.name}")
+
+    def finish_part_manual(self, part_number: int) -> None:
+        """Open the first-stage finishing browser without blocking Admin."""
+        if (
+            self.finish_orders_process is not None
+            and self.finish_orders_process.poll() is None
+        ):
+            print("! FinishOrders is already running; close its browser first")
+            return
+
+        script_path = BASE_DIR / "FinishOrders.py"
+        if not script_path.is_file():
+            print("! FinishOrders.py is missing; restart Admin to download it")
+            return
+
+        try:
+            self.finish_orders_process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(script_path),
+                    "--part",
+                    str(part_number),
+                    "--settings",
+                    str(SETTINGS_PATH),
+                ],
+                cwd=str(BASE_DIR),
+            )
+            print(f"* FinishOrders started for Part {part_number}")
+        except Exception as error:
+            print(f"! Cannot start FinishOrders: {error}")
 
     def copy_with_retry(self, file_path: Path) -> None:
         network_folder = Path(self.settings["NETWORK"]["downloads"])
@@ -1076,6 +1187,8 @@ def main() -> None:
     app: AdminApp | None = None
     try:
         check_for_updates()
+        ensure_companion_files()
+        ensure_finish_orders_settings()
         app = AdminApp(load_settings())
 
         def stop_handler(*_args) -> None:
