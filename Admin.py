@@ -78,7 +78,7 @@ from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "Admin_settings.json"
-CURRENT_VERSION = "3.2"
+CURRENT_VERSION = "3.3"
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/version.txt"
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/Admin.py"
 READ_PUSH_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/ReadPush.py"
@@ -114,6 +114,36 @@ def load_settings(path: Path = SETTINGS_PATH) -> dict:
 def configured_path(value: str) -> Path:
     path = Path(os.path.expandvars(value)).expanduser()
     return path if path.is_absolute() else BASE_DIR / path
+
+
+def statistics_order_match(text: str, order_id: str) -> re.Match[str] | None:
+    """Find a whitespace-delimited #OrderNumber anywhere in a statistics line."""
+    normalized = order_id.strip()
+    return re.search(rf"(?<!\S){re.escape(normalized)}(?=\s|$)", text)
+
+
+def statistics_order_suffix(text: str, order_id: str) -> str | None:
+    """Return assembler/status data following one statistics order number."""
+    match = statistics_order_match(text, order_id)
+    return text[match.end():] if match is not None else None
+
+
+def statistics_order_progress(status_suffix: str) -> tuple[bool, bool]:
+    """Return assembled/packed flags from text following an order number."""
+    if "+" not in status_suffix:
+        return False, False
+
+    after_plus = status_suffix.split("+", 1)[1].strip()
+    # A manual completion marker may be written as (+). Its closing bracket is
+    # not a packer name. Cancelled is a status marker rather than a name too.
+    after_plus = after_plus.lstrip(")]}:;- ").strip()
+    after_plus = re.sub(
+        r"(?:^|\s+)Cancelled\s*$",
+        "",
+        after_plus,
+        flags=re.IGNORECASE,
+    ).strip()
+    return True, bool(after_plus)
 
 
 def ensure_finish_orders_settings(path: Path = SETTINGS_PATH) -> None:
@@ -494,16 +524,17 @@ class AdminApp:
             self.finish_part_manual(part_number)
             return
 
-        match = re.fullmatch(r"(cancel|copy)\s+#?(\d+)", command, re.IGNORECASE)
-        if not match:
-            print("! Unknown command. Type: help")
+        cancel_match = re.fullmatch(r"cancel\s+#(\d+)", command, re.IGNORECASE)
+        if cancel_match:
+            self.cancel_order_greenpo_manual(f"#{cancel_match.group(1)}")
             return
-        action, number = match.groups()
-        order_id = f"#{number}"
-        if action.casefold() == "cancel":
-            self.cancel_order_greenpo_manual(order_id)
-        else:
-            self.copy_photo_from_network(order_id)
+
+        copy_match = re.fullmatch(r"copy\s+#?(\d+)", command, re.IGNORECASE)
+        if copy_match:
+            self.copy_photo_from_network(f"#{copy_match.group(1)}")
+            return
+
+        print("! Unknown command. Type: help")
 
     def print_part_manual(self, part_number: int) -> None:
         today = datetime.now().strftime("%d.%m.%Y")
@@ -613,12 +644,12 @@ class AdminApp:
         if not stat_file.exists():
             return "not_found"
         try:
-            order_pattern = re.compile(rf"^{re.escape(order_id)}(?=\D|$)")
             for line in stat_file.read_text(encoding="utf-8").splitlines():
-                if not order_pattern.match(line):
+                status_suffix = statistics_order_suffix(line, order_id)
+                if status_suffix is None:
                     continue
-                cancelled = "Cancelled" in line
-                completed = "+" in line or "(+)" in line
+                cancelled = "cancelled" in status_suffix.casefold()
+                completed = "+" in status_suffix
                 if cancelled and completed:
                     return "completed_cancelled"
                 if cancelled:
@@ -636,12 +667,12 @@ class AdminApp:
             lines = stat_file.read_text(encoding="utf-8").splitlines(keepends=True)
             found = False
             output: list[str] = []
-            order_pattern = re.compile(rf"^{re.escape(order_id)}(?=\D|$)")
             for line in lines:
                 stripped = line.rstrip("\r\n")
-                if order_pattern.match(stripped):
+                status_suffix = statistics_order_suffix(stripped, order_id)
+                if status_suffix is not None:
                     found = True
-                    if "Cancelled" not in stripped:
+                    if "cancelled" not in status_suffix.casefold():
                         stripped += " Cancelled"
                     line = stripped + "\n"
                 output.append(line)
@@ -661,25 +692,14 @@ class AdminApp:
         with self.statistics_lock:
             try:
                 lines = stat_file.read_text(encoding="utf-8").splitlines(keepends=True)
-                order_pattern = re.compile(rf"^{re.escape(order_id)}(?=\D|$)")
                 for line_number, line in enumerate(lines, start=1):
                     stripped = line.rstrip("\r\n")
-                    if not order_pattern.match(stripped):
+                    status_suffix = statistics_order_suffix(stripped, order_id)
+                    if status_suffix is None:
                         continue
 
-                    already_cancelled = "Cancelled" in stripped
-                    assembled = "+" in stripped
-                    packed = False
-                    if assembled:
-                        after_plus = stripped.split("+", 1)[1].strip()
-                        after_plus = after_plus.lstrip(")]}:;- ").strip()
-                        after_plus = re.sub(
-                            r"(?:^|\s+)Cancelled\s*$",
-                            "",
-                            after_plus,
-                            flags=re.IGNORECASE,
-                        ).strip()
-                        packed = bool(after_plus)
+                    already_cancelled = "cancelled" in status_suffix.casefold()
+                    assembled, packed = statistics_order_progress(status_suffix)
 
                     if not already_cancelled:
                         newline = (
