@@ -78,12 +78,18 @@ from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "Admin_settings.json"
-CURRENT_VERSION = "3.3"
+CURRENT_VERSION = "3.4"
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/version.txt"
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/Admin.py"
 READ_PUSH_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/ReadPush.py"
 FINISH_ORDERS_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/FinishOrders.py"
 MUTEX_NAME = "GreenPoAdminProgramMutex"
+
+STATISTICS_PART_HEADER_PATTERN = re.compile(
+    r"-+\s*\d{2}\.\d{2}\.\d{4}\s+Part\s+(\d+)\.pdf\s*-+",
+    re.IGNORECASE,
+)
+STATISTICS_ANY_ORDER_PATTERN = re.compile(r"(?<!\S)#\d+(?=\s|$)")
 
 COMPANION_FILES = {
     "ReadPush.py": READ_PUSH_URL,
@@ -144,6 +150,51 @@ def statistics_order_progress(status_suffix: str) -> tuple[bool, bool]:
         flags=re.IGNORECASE,
     ).strip()
     return True, bool(after_plus)
+
+
+def locate_statistics_order(
+    lines: list[str], order_id: str
+) -> tuple[int, int, int | None, int, str, re.Match[str]] | None:
+    """Locate an order and its one-based position under the latest Part header."""
+    part_number: int | None = None
+    number_in_part = 0
+    number_without_header = 0
+
+    for line_index, line in enumerate(lines):
+        text = line.rstrip("\r\n")
+        header = STATISTICS_PART_HEADER_PATTERN.search(text)
+        if header is not None:
+            part_number = int(header.group(1))
+            number_in_part = 0
+            continue
+
+        if STATISTICS_ANY_ORDER_PATTERN.search(text) is not None:
+            if part_number is None:
+                number_without_header += 1
+            else:
+                number_in_part += 1
+
+        match = statistics_order_match(text, order_id)
+        if match is not None:
+            order_number = (
+                number_in_part if part_number is not None else number_without_header
+            )
+            return (
+                line_index,
+                line_index + 1,
+                part_number,
+                order_number,
+                text,
+                match,
+            )
+    return None
+
+
+def statistics_order_location_text(
+    part_number: int | None, order_number: int
+) -> str:
+    part_text = str(part_number) if part_number is not None else "unknown"
+    return f"Part {part_text}, number {order_number}"
 
 
 def ensure_finish_orders_settings(path: Path = SETTINGS_PATH) -> None:
@@ -689,51 +740,111 @@ class AdminApp:
             print(f"! Today's statistics file was not found: {stat_file}")
             return False
 
-        with self.statistics_lock:
-            try:
+        try:
+            with self.statistics_lock:
                 lines = stat_file.read_text(encoding="utf-8").splitlines(keepends=True)
-                for line_number, line in enumerate(lines, start=1):
-                    stripped = line.rstrip("\r\n")
-                    status_suffix = statistics_order_suffix(stripped, order_id)
-                    if status_suffix is None:
-                        continue
+                location = locate_statistics_order(lines, order_id)
+                if location is None:
+                    print(f"! Active order not found: {order_id}")
+                    return False
 
-                    already_cancelled = "cancelled" in status_suffix.casefold()
-                    assembled, packed = statistics_order_progress(status_suffix)
+                (
+                    line_index,
+                    _line_number,
+                    part_number,
+                    order_number,
+                    stripped,
+                    order_match,
+                ) = location
+                status_suffix = stripped[order_match.end():]
+                already_cancelled = "cancelled" in status_suffix.casefold()
+                assembled, packed = statistics_order_progress(status_suffix)
 
-                    if not already_cancelled:
-                        newline = (
-                            "\r\n"
-                            if line.endswith("\r\n")
-                            else "\n" if line.endswith("\n") else ""
-                        )
-                        lines[line_number - 1] = f"{stripped} Cancelled{newline}"
-                        stat_file.write_text("".join(lines), encoding="utf-8")
-                        print(f"* ORDER CANCELLED: {order_id} (line {line_number})")
-                    else:
-                        print(
-                            f"* Order was already cancelled: {order_id} "
-                            f"(line {line_number})"
-                        )
+                if not already_cancelled:
+                    original_line = lines[line_index]
+                    newline = (
+                        "\r\n"
+                        if original_line.endswith("\r\n")
+                        else "\n" if original_line.endswith("\n") else ""
+                    )
+                    lines[line_index] = f"{stripped} Cancelled{newline}"
+                    stat_file.write_text("".join(lines), encoding="utf-8")
 
-                    warning_console = Console()
-                    if assembled:
-                        warning_console.print(
-                            f"[bold yellow]! Заказ {order_id} уже собран! "
-                            f"Строка: {line_number}[/]"
-                        )
-                    if packed:
-                        warning_console.print(
-                            f"[bold yellow]! Он уже упакован! "
-                            f"Заказ {order_id}, строка: {line_number}[/]"
-                        )
-                    return True
-            except Exception as error:
-                print(f"! Cannot cancel {order_id}: {error}")
-                return False
+            location_text = statistics_order_location_text(
+                part_number, order_number
+            )
+            status_console = Console()
 
-        print(f"! Active order not found: {order_id}")
-        return False
+            if not already_cancelled:
+                if not assembled:
+                    status_console.print(
+                        f"[bold green]✓ Order {order_id} cancelled successfully.[/]"
+                    )
+                else:
+                    status_console.print(
+                        f"[bold yellow]! Order {order_id} is already assembled! "
+                        f"{location_text}[/]"
+                    )
+                if packed:
+                    status_console.print(
+                        f"[bold red]! Order {order_id} is already packed! "
+                        f"{location_text}[/]"
+                    )
+                return True
+
+            removal_question = (
+                f"! Order {order_id} is already cancelled. "
+                "Remove cancellation? Enter y or n:"
+            )
+            if threading.current_thread() is threading.main_thread():
+                status_console.print(f"[bold yellow]{removal_question}[/]")
+                try:
+                    answer = input("> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    answer = ""
+            else:
+                answer = self.console_input.ask(removal_question) or ""
+
+            if answer.casefold() not in {"y", "yes", "у"}:
+                print(f"* Cancellation kept for order {order_id}")
+                return True
+
+            with self.statistics_lock:
+                lines = stat_file.read_text(encoding="utf-8").splitlines(keepends=True)
+                fresh_location = locate_statistics_order(lines, order_id)
+                if fresh_location is None:
+                    print(f"! Order not found while removing cancellation: {order_id}")
+                    return False
+
+                line_index, _, _, _, stripped, order_match = fresh_location
+                status_suffix = stripped[order_match.end():]
+                cleaned_suffix = re.sub(
+                    r"(?<!\S)Cancelled(?=\s|$)",
+                    "",
+                    status_suffix,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                cleaned_suffix = " ".join(cleaned_suffix.split())
+                cleaned_suffix = f" {cleaned_suffix}" if cleaned_suffix else ""
+                original_line = lines[line_index]
+                newline = (
+                    "\r\n"
+                    if original_line.endswith("\r\n")
+                    else "\n" if original_line.endswith("\n") else ""
+                )
+                lines[line_index] = (
+                    f"{stripped[:order_match.end()]}{cleaned_suffix}{newline}"
+                )
+                stat_file.write_text("".join(lines), encoding="utf-8")
+
+            status_console.print(
+                f"[bold green]✓ Cancellation removed from order {order_id}.[/]"
+            )
+            return True
+        except Exception as error:
+            print(f"! Cannot update cancellation for {order_id}: {error}")
+            return False
 
     def extract_order_numbers(self, pdf_path: Path) -> tuple[list[list], bool]:
         delivery_groups = {"UPS": [], "Zasilkovna": [], "Postal": []}
