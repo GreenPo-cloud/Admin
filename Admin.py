@@ -78,7 +78,7 @@ from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "Admin_settings.json"
-CURRENT_VERSION = "3.1"
+CURRENT_VERSION = "3.2"
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/version.txt"
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/Admin.py"
 READ_PUSH_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/ReadPush.py"
@@ -335,10 +335,12 @@ class AdminApp:
             return
 
         try:
+            configuration = self.settings.get("NOTIFICATION_BOT", {})
             thread = start_slack_notification_listener(
                 self.stop_event,
                 notification_filter=self.notification_sender_allowed,
                 on_notification=self.enqueue_notification,
+                debug_texts=bool(configuration.get("debug_texts", False)),
             )
             if thread is not None:
                 self.threads.append(thread)

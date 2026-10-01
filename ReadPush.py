@@ -213,18 +213,49 @@ def _fingerprint(record: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _notification_fields(record: dict[str, Any]) -> tuple[str, str] | None:
+def _notification_fields(
+    record: dict[str, Any],
+) -> tuple[str | None, str, str] | None:
+    """Return channel, human sender and message from a Windows toast.
+
+    Slack direct-message notifications normally contain two text elements:
+    sender and message.  Channel notifications normally prepend the channel
+    name, producing channel, sender and message.  Any additional text elements
+    belong to the message rather than changing the sender used by Admin's
+    allow-list.
+    """
     texts = _all_texts(record)
     if not texts:
         return None
+
+    if len(texts) >= 3:
+        channel = texts[0]
+        sender = texts[1]
+        message = " | ".join(texts[2:])
+        return channel, sender, message
+
     sender = texts[0]
-    message = " | ".join(texts[1:])
-    return sender, message
+    message = texts[1] if len(texts) == 2 else ""
+    return None, sender, message
 
 
-def _print_notification(sender: str, message: str) -> None:
+def _print_notification(channel: str | None, sender: str, message: str) -> None:
     print()
-    print(f"{BLUE_MARKER} {sender}: {message}" if message else f"{BLUE_MARKER} {sender}")
+    channel_prefix = f"[{channel}] " if channel else ""
+    print(
+        f"{BLUE_MARKER} {channel_prefix}{sender}: {message}"
+        if message
+        else f"{BLUE_MARKER} {channel_prefix}{sender}"
+    )
+    print("> ", end="", flush=True)
+
+
+def _print_text_debug(record: dict[str, Any]) -> None:
+    texts = _all_texts(record)
+    print()
+    print(f"{OTHER_MARKER} Text elements ({len(texts)}):")
+    for index, text in enumerate(texts, start=1):
+        print(f"  Text {index}: {text}")
     print("> ", end="", flush=True)
 
 
@@ -263,6 +294,7 @@ async def _listen(
     stop_event: threading.Event,
     notification_filter: Callable[[str], bool] | None,
     on_notification: Callable[[str, str], None] | None,
+    debug_texts: bool,
 ) -> None:
     (
         UserNotificationListener,
@@ -291,10 +323,12 @@ async def _listen(
             for identity, record in current.items():
                 previous = known.get(identity)
                 if previous is None or _fingerprint(previous) != _fingerprint(record):
+                    if debug_texts:
+                        _print_text_debug(record)
                     fields = _notification_fields(record)
                     if fields is None:
                         continue
-                    sender, message = fields
+                    channel, sender, message = fields
                     if notification_filter is not None:
                         try:
                             if not notification_filter(sender):
@@ -302,7 +336,7 @@ async def _listen(
                         except Exception as error:
                             print(f"{OTHER_MARKER} Notification filter failed: {error}")
                             continue
-                    _print_notification(sender, message)
+                    _print_notification(channel, sender, message)
                     if on_notification is not None:
                         try:
                             on_notification(sender, message)
@@ -334,9 +368,12 @@ def _thread_main(
     stop_event: threading.Event,
     notification_filter: Callable[[str], bool] | None,
     on_notification: Callable[[str, str], None] | None,
+    debug_texts: bool,
 ) -> None:
     try:
-        asyncio.run(_listen(stop_event, notification_filter, on_notification))
+        asyncio.run(
+            _listen(stop_event, notification_filter, on_notification, debug_texts)
+        )
     except Exception as error:
         print(f"{BLUE_MARKER} Windows push listener stopped: {error}")
 
@@ -345,6 +382,7 @@ def start_slack_notification_listener(
     stop_event: threading.Event,
     notification_filter: Callable[[str], bool] | None = None,
     on_notification: Callable[[str, str], None] | None = None,
+    debug_texts: bool = False,
 ) -> threading.Thread | None:
     """Request access on the main thread, then start the diagnostic listener."""
     (
@@ -360,7 +398,7 @@ def start_slack_notification_listener(
 
     thread = threading.Thread(
         target=_thread_main,
-        args=(stop_event, notification_filter, on_notification),
+        args=(stop_event, notification_filter, on_notification, debug_texts),
         name="Windows notification listener",
         daemon=True,
     )
