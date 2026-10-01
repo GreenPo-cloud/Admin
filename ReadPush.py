@@ -213,30 +213,39 @@ def _fingerprint(record: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _notification_fields(
+def _notification_candidates(
     record: dict[str, Any],
-) -> tuple[str | None, str, str] | None:
-    """Return channel, human sender and message from a Windows toast.
+) -> tuple[tuple[str | None, str, str], ...]:
+    """Return possible channel/sender/message interpretations of a toast.
 
-    Slack direct-message notifications normally contain two text elements:
-    sender and message.  Channel notifications normally prepend the channel
-    name, producing channel, sender and message.  Any additional text elements
-    belong to the message rather than changing the sender used by Admin's
-    allow-list.
+    Slack uses two different two-text layouts on the target computers:
+    direct messages are ``sender`` + ``message``, while channel messages are
+    ``channel`` + ``sender: message``.  Both candidates are returned so Admin's
+    sender allow-list can select the correct interpretation without breaking a
+    direct message whose body happens to contain a colon.
     """
     texts = _all_texts(record)
     if not texts:
-        return None
+        return ()
 
     if len(texts) >= 3:
         channel = texts[0]
         sender = texts[1]
         message = " | ".join(texts[2:])
-        return channel, sender, message
+        return ((channel, sender, message),)
 
-    sender = texts[0]
-    message = texts[1] if len(texts) == 2 else ""
-    return None, sender, message
+    if len(texts) == 2:
+        title, body = texts
+        candidates: list[tuple[str | None, str, str]] = []
+        possible_sender, separator, possible_message = body.partition(":")
+        if separator and possible_sender.strip():
+            candidates.append(
+                (title, possible_sender.strip(), possible_message.lstrip())
+            )
+        candidates.append((None, title, body))
+        return tuple(candidates)
+
+    return ((None, texts[0], ""),)
 
 
 def _print_notification(channel: str | None, sender: str, message: str) -> None:
@@ -325,17 +334,30 @@ async def _listen(
                 if previous is None or _fingerprint(previous) != _fingerprint(record):
                     if debug_texts:
                         _print_text_debug(record)
-                    fields = _notification_fields(record)
+                    candidates = _notification_candidates(record)
+                    if not candidates:
+                        continue
+
+                    fields = candidates[0] if notification_filter is None else None
+                    if notification_filter is not None:
+                        for candidate in candidates:
+                            try:
+                                if notification_filter(candidate[1]):
+                                    fields = candidate
+                                    break
+                            except Exception as error:
+                                print(
+                                    f"{OTHER_MARKER} Notification filter failed: "
+                                    f"{error}"
+                                )
+                                fields = None
+                                break
                     if fields is None:
                         continue
+
                     channel, sender, message = fields
-                    if notification_filter is not None:
-                        try:
-                            if not notification_filter(sender):
-                                continue
-                        except Exception as error:
-                            print(f"{OTHER_MARKER} Notification filter failed: {error}")
-                            continue
+                    if not sender:
+                        continue
                     _print_notification(channel, sender, message)
                     if on_notification is not None:
                         try:
