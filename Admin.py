@@ -78,7 +78,7 @@ from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "Admin_settings.json"
-CURRENT_VERSION = "3.5"
+CURRENT_VERSION = "3.6"
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/version.txt"
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/Admin.py"
 READ_PUSH_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/ReadPush.py"
@@ -846,7 +846,25 @@ class AdminApp:
             print(f"! Cannot update cancellation for {order_id}: {error}")
             return False
 
-    def extract_order_numbers(self, pdf_path: Path) -> tuple[list[list], bool]:
+    @staticmethod
+    def contains_ups_access_point(text: str) -> bool:
+        normalized = " ".join(text.casefold().split())
+        spellings = ("ups access point", "ups acces point")
+        return any(
+            spelling in normalized
+            or fuzz.partial_ratio(spelling, normalized) >= 90
+            for spelling in spellings
+        )
+
+    def notify_ups_access_point(self, order_number: str) -> None:
+        Console().print(
+            f"[bold cyan]! UPS Access Point detected for order {order_number}[/]"
+        )
+        self.play_sound("ups")
+
+    def extract_order_numbers(
+        self, pdf_path: Path, *, notify_access_points: bool = False
+    ) -> tuple[list[list], bool]:
         delivery_groups = {"UPS": [], "Zasilkovna": [], "Postal": []}
         access_point_found = False
         seen_orders: set[str] = set()
@@ -863,10 +881,10 @@ class AdminApp:
                         if order_number in seen_orders:
                             continue
                         seen_orders.add(order_number)
-                        if fuzz.partial_ratio("ups access point", tail.casefold()) >= 90:
-                            print(f"! UPS Access Point detected: {order_number}")
+                        if self.contains_ups_access_point(tail):
                             access_point_found = True
-                            self.play_sound("ups")
+                            if notify_access_points:
+                                self.notify_ups_access_point(order_number)
                         delivery_groups[delivery].append([order_number, name.strip(), bool(stealth)])
         except Exception as error:
             print(f"! Cannot process PDF: {error}")
@@ -1251,6 +1269,10 @@ class PDFHandler(FileSystemEventHandler):
             try:
                 if name == "mpdf.pdf":
                     renamed = self.rename_order_pdf(file_path)
+                    self.app.extract_order_numbers(
+                        renamed, notify_access_points=True
+                    )
+                    self.app.send_pdf(renamed)
                     part_number = renamed.stem.rsplit(" ", 1)[-1]
                     print(f"* Printing is waiting for command: print part {part_number}")
                 elif name == "qwe.pdf":
@@ -1271,7 +1293,6 @@ class PDFHandler(FileSystemEventHandler):
         destination = self.app.downloads / f"{today} Part {max(parts, default=0) + 1}.pdf"
         os.replace(source, destination)
         print(f"* Order PDF renamed: {destination.name}")
-        self.app.send_pdf(destination)
         return destination
 
     def rename_label_pdf(self, source: Path) -> Path:
