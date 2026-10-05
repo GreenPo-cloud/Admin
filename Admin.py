@@ -78,7 +78,7 @@ from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "Admin_settings.json"
-CURRENT_VERSION = "3.6"
+CURRENT_VERSION = "3.10"
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/version.txt"
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/Admin.py"
 READ_PUSH_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/ReadPush.py"
@@ -90,6 +90,10 @@ STATISTICS_PART_HEADER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 STATISTICS_ANY_ORDER_PATTERN = re.compile(r"(?<!\S)#\d+(?=\s|$)")
+CHANGE_LABEL_SOURCE_PATTERN = re.compile(
+    r"^change\s+(\d+(?:\s*,\s*\d+)*)\.pdf$",
+    re.IGNORECASE,
+)
 
 COMPANION_FILES = {
     "ReadPush.py": READ_PUSH_URL,
@@ -136,6 +140,12 @@ def statistics_order_suffix(text: str, order_id: str) -> str | None:
 
 def statistics_order_progress(status_suffix: str) -> tuple[bool, bool]:
     """Return assembled/packed flags from text following an order number."""
+    change_markers = list(
+        re.finditer(r"(?<!\w)Change(?!\w)", status_suffix, re.IGNORECASE)
+    )
+    if change_markers:
+        status_suffix = status_suffix[change_markers[-1].end():]
+
     if "+" not in status_suffix:
         return False, False
 
@@ -397,8 +407,11 @@ class AdminApp:
         self._start_thread(self.pdf_copy_worker, "PDF copy worker")
         self._start_thread(self.notification_command_worker, "notification command worker")
         self.start_push_listener()
-        print("* Watching Downloads for mpdf.pdf, qwe.pdf and qwez.pdf")
-        print("* Commands: print part N | send part N | finish part N | cancel #1234567 | copy #1234567 | help | exit")
+        print(
+            "* Watching Downloads for mpdf.pdf, qwe.pdf, qwez.pdf, "
+            "change.pdf and change ORDER.pdf"
+        )
+        print("* Commands: print part N | send part N | finish part N | cancel [#]1234567 | copy [#]1234567 | help | exit")
         self.console_loop()
 
     def start_push_listener(self) -> None:
@@ -541,8 +554,8 @@ class AdminApp:
             print("print part N     - print today's order PDF Part N")
             print("send part N      - send today's Label PDF Part N")
             print("finish part N    - open the order-finishing website for Part N")
-            print("cancel #1234567  - mark an order Cancelled")
-            print("copy #1234567    - copy matching photos to Desktop")
+            print("cancel [#]1234567  - mark an order Cancelled")
+            print("copy [#]1234567    - copy matching photos to Desktop")
             print("exit             - stop Admin")
             return
 
@@ -575,7 +588,7 @@ class AdminApp:
             self.finish_part_manual(part_number)
             return
 
-        cancel_match = re.fullmatch(r"cancel\s+#(\d+)", command, re.IGNORECASE)
+        cancel_match = re.fullmatch(r"cancel\s+#?(\d+)", command, re.IGNORECASE)
         if cancel_match:
             self.cancel_order_greenpo_manual(f"#{cancel_match.group(1)}")
             return
@@ -669,21 +682,46 @@ class AdminApp:
 
     def copy_photo_from_network(self, order_id: str) -> int:
         network_folder = Path(self.settings["NETWORK"]["photos"])
-        order_pattern = re.compile(rf"{re.escape(order_id)}(?=\D|$)", re.IGNORECASE)
+        order_number = order_id.strip().lstrip("#")
+        normalized_order_id = f"#{order_number}"
+        order_pattern = re.compile(
+            rf"(?<!\d)#?{re.escape(order_number)}(?!\d)",
+            re.IGNORECASE,
+        )
+        image_extensions = {
+            ".bmp",
+            ".heic",
+            ".jpeg",
+            ".jfif",
+            ".jpg",
+            ".png",
+            ".tif",
+            ".tiff",
+            ".webp",
+        }
         copied = 0
         try:
-            for source in network_folder.iterdir():
+            for source in network_folder.rglob("*"):
                 if (
                     source.is_file()
-                    and source.suffix.casefold() in {".jpg", ".jpeg", ".png"}
+                    and source.suffix.casefold() in image_extensions
                     and order_pattern.search(source.name)
                 ):
-                    shutil.copy2(source, self.desktop / source.name)
-                    copied += 1
+                    try:
+                        shutil.copy2(source, self.desktop / source.name)
+                        copied += 1
+                    except Exception as error:
+                        print(f"! Cannot copy photo {source.name}: {error}")
         except Exception as error:
-            print(f"! Cannot copy photos: {error}")
+            print(f"! Cannot search photos in {network_folder}: {error}")
             return 0
-        print(f"* Photos copied for {order_id}: {copied}" if copied else f"! No photos found for {order_id}")
+        if copied:
+            print(f"* Photos copied for {normalized_order_id}: {copied}")
+        else:
+            print(
+                f"! No photos found for {normalized_order_id} "
+                f"in {network_folder}"
+            )
         return copied
 
     def statistics_path(self) -> Path:
@@ -700,7 +738,7 @@ class AdminApp:
                 if status_suffix is None:
                     continue
                 cancelled = "cancelled" in status_suffix.casefold()
-                completed = "+" in status_suffix
+                completed, _packed = statistics_order_progress(status_suffix)
                 if cancelled and completed:
                     return "completed_cancelled"
                 if cancelled:
@@ -733,6 +771,66 @@ class AdminApp:
         except Exception as error:
             print(f"! Cannot update statistics: {error}")
             return False
+
+    @staticmethod
+    def print_order_progress_warnings(
+        order_id: str,
+        part_number: int | None,
+        order_number: int,
+        *,
+        assembled: bool,
+        packed: bool,
+    ) -> None:
+        """Print the shared assembled/packed warnings without changing statistics."""
+        location_text = statistics_order_location_text(part_number, order_number)
+        status_console = Console()
+        if assembled:
+            status_console.print(
+                f"[bold yellow]! Order {order_id} is already assembled! "
+                f"{location_text}[/]"
+            )
+        if packed:
+            status_console.print(
+                f"[bold red]! Order {order_id} is already packed! "
+                f"{location_text}[/]"
+            )
+
+    def report_order_progress(self, order_ids: list[str]) -> None:
+        """Report existing assembly/packing state without modifying statistics."""
+        stat_file = self.statistics_path()
+        if not stat_file.exists():
+            print(f"! Today's statistics file was not found: {stat_file}")
+            return
+
+        try:
+            with self.statistics_lock:
+                lines = stat_file.read_text(encoding="utf-8").splitlines(keepends=True)
+
+            for order_id in order_ids:
+                location = locate_statistics_order(lines, order_id)
+                if location is None:
+                    print(f"! Order not found in today's statistics: {order_id}")
+                    continue
+
+                (
+                    _line_index,
+                    _line_number,
+                    part_number,
+                    order_number,
+                    stripped,
+                    order_match,
+                ) = location
+                status_suffix = stripped[order_match.end():]
+                assembled, packed = statistics_order_progress(status_suffix)
+                self.print_order_progress_warnings(
+                    order_id,
+                    part_number,
+                    order_number,
+                    assembled=assembled,
+                    packed=packed,
+                )
+        except Exception as error:
+            print(f"! Cannot read order progress: {error}")
 
     def cancel_order_greenpo_manual(self, order_id: str) -> bool:
         stat_file = self.statistics_path()
@@ -770,9 +868,6 @@ class AdminApp:
                     lines[line_index] = f"{stripped} Cancelled{newline}"
                     stat_file.write_text("".join(lines), encoding="utf-8")
 
-            location_text = statistics_order_location_text(
-                part_number, order_number
-            )
             status_console = Console()
 
             if not already_cancelled:
@@ -781,14 +876,12 @@ class AdminApp:
                         f"[bold green]✓ Order {order_id} cancelled successfully.[/]"
                     )
                 else:
-                    status_console.print(
-                        f"[bold yellow]! Order {order_id} is already assembled! "
-                        f"{location_text}[/]"
-                    )
-                if packed:
-                    status_console.print(
-                        f"[bold red]! Order {order_id} is already packed! "
-                        f"{location_text}[/]"
+                    self.print_order_progress_warnings(
+                        order_id,
+                        part_number,
+                        order_number,
+                        assembled=assembled,
+                        packed=packed,
                     )
                 return True
 
@@ -864,10 +957,12 @@ class AdminApp:
 
     def extract_order_numbers(
         self, pdf_path: Path, *, notify_access_points: bool = False
-    ) -> tuple[list[list], bool]:
+    ) -> tuple[list[list], bool, list[str]]:
         delivery_groups = {"UPS": [], "Zasilkovna": [], "Postal": []}
         access_point_found = False
         seen_orders: set[str] = set()
+        seen_order_numbers: set[str] = set()
+        ordered_order_numbers: list[str] = []
         pattern = re.compile(
             r"(?m)^(#\d+)(?=[^#]*☐).*?type( STEALTH)?\s*\n(.*?)\s*☐"
             r".*?(UPS|Zasilkovna|Postal)(.*?)(?=^#\d+|\Z)",
@@ -877,6 +972,10 @@ class AdminApp:
             with pdfplumber.open(pdf_path) as pdf:
                 for page in pdf.pages:
                     text = page.extract_text() or ""
+                    for order_number in re.findall(r"(?<![\w#])#\d+(?!\d)", text):
+                        if order_number not in seen_order_numbers:
+                            seen_order_numbers.add(order_number)
+                            ordered_order_numbers.append(order_number)
                     for order_number, stealth, name, delivery, tail in pattern.findall(text):
                         if order_number in seen_orders:
                             continue
@@ -888,9 +987,9 @@ class AdminApp:
                         delivery_groups[delivery].append([order_number, name.strip(), bool(stealth)])
         except Exception as error:
             print(f"! Cannot process PDF: {error}")
-            return [], False
+            return [], False, []
         orders = delivery_groups["UPS"] + delivery_groups["Zasilkovna"] + delivery_groups["Postal"]
-        return orders, access_point_found
+        return orders, access_point_found, ordered_order_numbers
 
     def get_connected_printer(self):
         printer_name = self.settings["PRINTER"]["name"]
@@ -965,7 +1064,7 @@ class AdminApp:
     def process_order_pdf(self, pdf_path: Path) -> None:
         with self.print_lock:
             print(f"* Processing orders: {pdf_path.name}")
-            orders, _ = self.extract_order_numbers(pdf_path)
+            orders, _, _ = self.extract_order_numbers(pdf_path)
             if not orders:
                 print("! No order numbers found")
                 return
@@ -1227,7 +1326,13 @@ class PDFHandler(FileSystemEventHandler):
             self._dispatch(Path(event.dest_path))
 
     def _dispatch(self, file_path: Path) -> None:
-        if file_path.name.casefold() not in {"mpdf.pdf", "qwe.pdf", "qwez.pdf"}:
+        name = file_path.name.casefold()
+        if name not in {
+            "mpdf.pdf",
+            "qwe.pdf",
+            "qwez.pdf",
+            "change.pdf",
+        } and CHANGE_LABEL_SOURCE_PATTERN.fullmatch(file_path.name) is None:
             return
 
         # A browser/download manager can produce both created and moved events
@@ -1262,6 +1367,9 @@ class PDFHandler(FileSystemEventHandler):
     def _process(self, file_path: Path) -> None:
         with self.processing_lock:
             name = file_path.name.casefold()
+            change_label_match = CHANGE_LABEL_SOURCE_PATTERN.fullmatch(
+                file_path.name
+            )
             print(f"* Download detected: {file_path.name}")
             if not wait_until_file_is_ready(file_path):
                 print(f"! Download did not become ready: {file_path.name}")
@@ -1275,6 +1383,27 @@ class PDFHandler(FileSystemEventHandler):
                     self.app.send_pdf(renamed)
                     part_number = renamed.stem.rsplit(" ", 1)[-1]
                     print(f"* Printing is waiting for command: print part {part_number}")
+                elif name == "change.pdf":
+                    _, _, order_numbers = self.app.extract_order_numbers(
+                        file_path, notify_access_points=True
+                    )
+                    if not order_numbers:
+                        raise ValueError(
+                            "No order numbers were found in change.pdf"
+                        )
+                    renamed = self.rename_change_pdf(file_path, order_numbers)
+                    self.app.report_order_progress(order_numbers)
+                    self.app.send_pdf(renamed)
+                elif change_label_match is not None:
+                    order_numbers = [
+                        f"#{number.strip()}"
+                        for number in change_label_match.group(1).split(",")
+                    ]
+                    renamed = self.rename_change_label_pdf(
+                        file_path, order_numbers
+                    )
+                    self.app.report_order_progress(order_numbers)
+                    self.app.send_pdf(renamed)
                 elif name == "qwe.pdf":
                     self.rename_label_pdf(file_path)
                 else:
@@ -1293,6 +1422,28 @@ class PDFHandler(FileSystemEventHandler):
         destination = self.app.downloads / f"{today} Part {max(parts, default=0) + 1}.pdf"
         os.replace(source, destination)
         print(f"* Order PDF renamed: {destination.name}")
+        return destination
+
+    def rename_change_pdf(self, source: Path, order_numbers: list[str]) -> Path:
+        today = datetime.now().strftime("%d.%m.%Y")
+        joined_orders = ", ".join(order_numbers)
+        destination = self.app.downloads / (
+            f"Change {joined_orders} ({today}).pdf"
+        )
+        os.replace(source, destination)
+        print(f"* Change PDF renamed: {destination.name}")
+        return destination
+
+    def rename_change_label_pdf(
+        self, source: Path, order_numbers: list[str]
+    ) -> Path:
+        today = datetime.now().strftime("%d.%m.%Y")
+        joined_orders = ", ".join(order_numbers)
+        destination = self.app.downloads / (
+            f"Change Label {joined_orders} ({today}).pdf"
+        )
+        os.replace(source, destination)
+        print(f"* Change Label PDF renamed: {destination.name}")
         return destination
 
     def rename_label_pdf(self, source: Path) -> Path:
