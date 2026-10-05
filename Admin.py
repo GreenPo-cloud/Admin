@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
@@ -78,7 +79,7 @@ from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "Admin_settings.json"
-CURRENT_VERSION = "3.10"
+CURRENT_VERSION = "3.11"
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/version.txt"
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/Admin.py"
 READ_PUSH_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/ReadPush.py"
@@ -100,6 +101,56 @@ COMPANION_FILES = {
     "FinishOrders.py": FINISH_ORDERS_URL,
 }
 
+SETTINGS_DEFAULTS = {
+    "CAMERA": {
+        "name": "Camera 3",
+        "focus": 360,
+        "width": 4656,
+        "height": 3496,
+        "warmup_seconds": 2,
+        "photo_delay_seconds": 2,
+        "idle_timeout_seconds": 10,
+    },
+    "PRINTER": {
+        "name": "DYMO LabelWriter 450 Twin Turbo",
+        "order_label": "~/Desktop/order_barcode.dymo",
+        "stealth_label": "~/Desktop/stealth_barcode.dymo",
+        "roll": 2,
+        "delay": 1,
+    },
+    "COM": {"port": "COM7", "baudrate": 9600},
+    "PATHS": {
+        "downloads": "~/Downloads",
+        "photo_folder": "~/Desktop/RepackFoto",
+        "workers": "workers.json",
+        "sounds": {
+            "good": "~/Desktop/good.mp3",
+            "bad": "~/Desktop/bad.mp3",
+            "error": "~/Desktop/error.mp3",
+            "ups": "~/Desktop/ups.mp3",
+        },
+    },
+    "NETWORK": {
+        "downloads": r"\\GREENPO\Downloads",
+        "photos": r"\\GREENPO\Photo",
+        "statistics": r"\\GREENPO\Statistik2",
+    },
+    "NOTIFICATION_BOT": {
+        "enabled": True,
+        "mode": "confirm",
+        "allowed_senders": ["Egor Stolyga"],
+        "cancel_similarity_threshold": 82,
+        "debug_texts": False,
+    },
+    "FINISH_ORDERS": {
+        "site_url": "",
+        "browser_channel": "chrome",
+        "browser_profile": "BrowserProfile",
+        "logs_folder": "~/Desktop/FinishOrdersLogs",
+    },
+    "ORDERS": {},
+}
+
 
 def version_key(value: str) -> tuple[int, ...] | None:
     match = re.fullmatch(r"v?(\d+(?:\.\d+)*)", value.strip(), re.IGNORECASE)
@@ -119,6 +170,74 @@ def load_settings(path: Path = SETTINGS_PATH) -> dict:
     if missing:
         raise RuntimeError(f"Missing settings sections: {', '.join(missing)}")
     return settings
+
+
+def add_missing_setting_values(current: dict, defaults: dict) -> list[str]:
+    """Add missing nested defaults while preserving every configured value."""
+    added: list[str] = []
+    for key, default_value in defaults.items():
+        if key not in current:
+            current[key] = deepcopy(default_value)
+            added.append(key)
+        elif isinstance(default_value, dict) and isinstance(current[key], dict):
+            added.extend(
+                f"{key}.{nested_key}"
+                for nested_key in add_missing_setting_values(
+                    current[key], default_value
+                )
+            )
+    return added
+
+
+def synchronize_settings(path: Path = SETTINGS_PATH) -> dict:
+    """Synchronize Admin settings sections without replacing local values."""
+    if path.exists():
+        try:
+            settings = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"Invalid JSON in {path.name}: {error}") from error
+        except OSError as error:
+            raise RuntimeError(f"Cannot read {path}: {error}") from error
+        if not isinstance(settings, dict):
+            raise RuntimeError(f"{path.name} must contain a JSON object")
+    else:
+        settings = {}
+
+    synchronized: dict = {}
+    added: list[str] = []
+    for section, defaults in SETTINGS_DEFAULTS.items():
+        existing = settings.get(section)
+        if not isinstance(existing, dict):
+            existing = deepcopy(defaults)
+            added.append(section)
+        else:
+            added.extend(
+                f"{section}.{key}"
+                for key in add_missing_setting_values(existing, defaults)
+            )
+        synchronized[section] = existing
+
+    removed = [key for key in settings if key not in SETTINGS_DEFAULTS]
+    if synchronized != settings:
+        temporary = path.with_name(f".{path.name}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(synchronized, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+        changes = []
+        if added:
+            changes.append(f"added: {', '.join(added)}")
+        if removed:
+            changes.append(f"removed: {', '.join(removed)}")
+        print(f"* {path.name} synchronized ({'; '.join(changes)})")
+
+    return synchronized
 
 
 def configured_path(value: str) -> Path:
@@ -205,30 +324,6 @@ def statistics_order_location_text(
 ) -> str:
     part_text = str(part_number) if part_number is not None else "unknown"
     return f"Part {part_text}, number {order_number}"
-
-
-def ensure_finish_orders_settings(path: Path = SETTINGS_PATH) -> None:
-    """Add the local-only FinishOrders settings after the first code update."""
-    try:
-        settings = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        print(f"! Cannot prepare FINISH_ORDERS settings: {error}")
-        return
-
-    if isinstance(settings.get("FINISH_ORDERS"), dict):
-        return
-
-    settings["FINISH_ORDERS"] = {
-        "site_url": "",
-        "browser_channel": "chrome",
-        "browser_profile": "BrowserProfile",
-        "logs_folder": "~/Desktop/FinishOrdersLogs",
-    }
-    path.write_text(
-        json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    print("* Added FINISH_ORDERS section to Admin_settings.json")
 
 
 def check_for_updates() -> None:
@@ -699,14 +794,25 @@ class AdminApp:
             ".tiff",
             ".webp",
         }
+        matched = 0
         copied = 0
+
+        def raise_walk_error(error: OSError) -> None:
+            raise error
+
         try:
-            for source in network_folder.rglob("*"):
-                if (
-                    source.is_file()
-                    and source.suffix.casefold() in image_extensions
-                    and order_pattern.search(source.name)
-                ):
+            for folder, _subfolders, filenames in os.walk(
+                network_folder,
+                onerror=raise_walk_error,
+            ):
+                for filename in filenames:
+                    source = Path(folder) / filename
+                    if (
+                        source.suffix.casefold() not in image_extensions
+                        or order_pattern.search(filename) is None
+                    ):
+                        continue
+                    matched += 1
                     try:
                         shutil.copy2(source, self.desktop / source.name)
                         copied += 1
@@ -717,6 +823,11 @@ class AdminApp:
             return 0
         if copied:
             print(f"* Photos copied for {normalized_order_id}: {copied}")
+        elif matched:
+            print(
+                f"! {matched} matching photo(s) found for "
+                f"{normalized_order_id}, but none could be copied"
+            )
         else:
             print(
                 f"! No photos found for {normalized_order_id} "
@@ -728,12 +839,27 @@ class AdminApp:
         today = datetime.now().strftime("%d.%m.%Y")
         return Path(self.settings["NETWORK"]["statistics"]) / f"{today}.txt"
 
-    def get_greenpo_order_status(self, order_id: str) -> str:
+    def read_statistics_lines(self, *, keepends: bool = False) -> list[str] | None:
+        """Read today's statistics and expose the real network/filesystem error."""
         stat_file = self.statistics_path()
-        if not stat_file.exists():
+        try:
+            return stat_file.read_text(encoding="utf-8").splitlines(
+                keepends=keepends
+            )
+        except FileNotFoundError as error:
+            print(f"! Statistics file is unavailable: {stat_file}: {error}")
+        except PermissionError as error:
+            print(f"! Access denied to statistics file: {stat_file}: {error}")
+        except OSError as error:
+            print(f"! Cannot open statistics file: {stat_file}: {error}")
+        return None
+
+    def get_greenpo_order_status(self, order_id: str) -> str:
+        lines = self.read_statistics_lines()
+        if lines is None:
             return "not_found"
         try:
-            for line in stat_file.read_text(encoding="utf-8").splitlines():
+            for line in lines:
                 status_suffix = statistics_order_suffix(line, order_id)
                 if status_suffix is None:
                     continue
@@ -750,10 +876,10 @@ class AdminApp:
 
     def update_greenpo_statistics(self, order_id: str) -> bool:
         stat_file = self.statistics_path()
-        if not stat_file.exists():
+        lines = self.read_statistics_lines(keepends=True)
+        if lines is None:
             return False
         try:
-            lines = stat_file.read_text(encoding="utf-8").splitlines(keepends=True)
             found = False
             output: list[str] = []
             for line in lines:
@@ -797,14 +923,11 @@ class AdminApp:
 
     def report_order_progress(self, order_ids: list[str]) -> None:
         """Report existing assembly/packing state without modifying statistics."""
-        stat_file = self.statistics_path()
-        if not stat_file.exists():
-            print(f"! Today's statistics file was not found: {stat_file}")
-            return
-
         try:
             with self.statistics_lock:
-                lines = stat_file.read_text(encoding="utf-8").splitlines(keepends=True)
+                lines = self.read_statistics_lines(keepends=True)
+            if lines is None:
+                return
 
             for order_id in order_ids:
                 location = locate_statistics_order(lines, order_id)
@@ -834,13 +957,11 @@ class AdminApp:
 
     def cancel_order_greenpo_manual(self, order_id: str) -> bool:
         stat_file = self.statistics_path()
-        if not stat_file.exists():
-            print(f"! Today's statistics file was not found: {stat_file}")
-            return False
-
         try:
             with self.statistics_lock:
-                lines = stat_file.read_text(encoding="utf-8").splitlines(keepends=True)
+                lines = self.read_statistics_lines(keepends=True)
+                if lines is None:
+                    return False
                 location = locate_statistics_order(lines, order_id)
                 if location is None:
                     print(f"! Active order not found: {order_id}")
@@ -903,7 +1024,9 @@ class AdminApp:
                 return True
 
             with self.statistics_lock:
-                lines = stat_file.read_text(encoding="utf-8").splitlines(keepends=True)
+                lines = self.read_statistics_lines(keepends=True)
+                if lines is None:
+                    return False
                 fresh_location = locate_statistics_order(lines, order_id)
                 if fresh_location is None:
                     print(f"! Order not found while removing cancellation: {order_id}")
@@ -1493,8 +1616,7 @@ def main() -> None:
     try:
         check_for_updates()
         ensure_companion_files()
-        ensure_finish_orders_settings()
-        app = AdminApp(load_settings())
+        app = AdminApp(synchronize_settings())
 
         def stop_handler(*_args) -> None:
             app.stop_event.set()
