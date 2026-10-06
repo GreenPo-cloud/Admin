@@ -79,7 +79,7 @@ from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "Admin_settings.json"
-CURRENT_VERSION = "3.11"
+CURRENT_VERSION = "3.12"
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/version.txt"
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/Admin.py"
 READ_PUSH_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/ReadPush.py"
@@ -91,6 +91,8 @@ STATISTICS_PART_HEADER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 STATISTICS_ANY_ORDER_PATTERN = re.compile(r"(?<!\S)#\d+(?=\s|$)")
+UPS_TRACKING_PATTERN = re.compile(r"^1ZR", re.IGNORECASE)
+PACKETA_TRACKING_PATTERN = re.compile(r"^Z\d{5,}(?=\s|$)", re.IGNORECASE)
 CHANGE_LABEL_SOURCE_PATTERN = re.compile(
     r"^change\s+(\d+(?:\s*,\s*\d+)*)\.pdf$",
     re.IGNORECASE,
@@ -326,6 +328,19 @@ def statistics_order_location_text(
     return f"Part {part_text}, number {order_number}"
 
 
+def statistics_delivery_type(text: str) -> str | None:
+    """Classify one statistics order line by its tracking-number field."""
+    if STATISTICS_ANY_ORDER_PATTERN.search(text) is None:
+        return None
+    if UPS_TRACKING_PATTERN.match(text):
+        return "UPS"
+    if PACKETA_TRACKING_PATTERN.match(text):
+        return "Packeta"
+    if text[:1].isspace():
+        return "Postal"
+    return None
+
+
 def check_for_updates() -> None:
     """Check once at startup and install only a strictly newer version."""
     try:
@@ -506,7 +521,7 @@ class AdminApp:
             "* Watching Downloads for mpdf.pdf, qwe.pdf, qwez.pdf, "
             "change.pdf and change ORDER.pdf"
         )
-        print("* Commands: print part N | send part N | finish part N | cancel [#]1234567 | copy [#]1234567 | help | exit")
+        print("* Commands: print part N | send part N | finish part N | cancel [#]1234567 | copy [#]1234567 | check | help | exit")
         self.console_loop()
 
     def start_push_listener(self) -> None:
@@ -651,7 +666,12 @@ class AdminApp:
             print("finish part N    - open the order-finishing website for Part N")
             print("cancel [#]1234567  - mark an order Cancelled")
             print("copy [#]1234567    - copy matching photos to Desktop")
+            print("check               - check completion of today's orders")
             print("exit             - stop Admin")
+            return
+
+        if command.casefold() == "check":
+            self.check_orders_completion()
             return
 
         print_match = re.fullmatch(r"print\s+part\s+(\d+)", command, re.IGNORECASE)
@@ -853,6 +873,70 @@ class AdminApp:
         except OSError as error:
             print(f"! Cannot open statistics file: {stat_file}: {error}")
         return None
+
+    @staticmethod
+    def print_completion_summary(
+        delivery: str,
+        incomplete: list[str],
+        cancelled: list[str],
+    ) -> None:
+        """Print exactly one coloured completion line for one delivery type."""
+        console = Console()
+        if incomplete:
+            message = (
+                f"! {delivery}: incomplete orders: {', '.join(incomplete)}."
+            )
+            colour = "bold red"
+        else:
+            message = f"✓ {delivery}: all orders are completed."
+            colour = "bold green"
+
+        if cancelled:
+            message += f" Cancelled orders: {', '.join(cancelled)}."
+        console.print(f"[{colour}]{message}[/]")
+
+    def check_orders_completion(self) -> None:
+        """Check today's UPS, Packeta and Postal orders without modifying them."""
+        lines = self.read_statistics_lines()
+        if lines is None:
+            return
+
+        results = {
+            "UPS": {"incomplete": [], "cancelled": []},
+            "Packeta": {"incomplete": [], "cancelled": []},
+            "Postal": {"incomplete": [], "cancelled": []},
+        }
+
+        for line in lines:
+            order_match = STATISTICS_ANY_ORDER_PATTERN.search(line)
+            delivery = statistics_delivery_type(line)
+            if order_match is None or delivery is None:
+                continue
+
+            order_id = order_match.group(0)
+            status = results[delivery]
+            if re.search(r"(?<!\w)Cancelled(?!\w)", line, re.IGNORECASE):
+                if order_id not in status["cancelled"]:
+                    status["cancelled"].append(order_id)
+                continue
+
+            status_suffix = line[order_match.end():]
+            assembled, packed = statistics_order_progress(status_suffix)
+            if (not assembled or not packed) and order_id not in status["incomplete"]:
+                status["incomplete"].append(order_id)
+
+        display_names = {
+            "UPS": "UPS",
+            "Packeta": "Zásilkovna (Packeta)",
+            "Postal": "Postal",
+        }
+        for delivery in ("UPS", "Packeta", "Postal"):
+            status = results[delivery]
+            self.print_completion_summary(
+                display_names[delivery],
+                status["incomplete"],
+                status["cancelled"],
+            )
 
     def get_greenpo_order_status(self, order_id: str) -> str:
         lines = self.read_statistics_lines()
