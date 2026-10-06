@@ -79,7 +79,7 @@ from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "Admin_settings.json"
-CURRENT_VERSION = "3.12"
+CURRENT_VERSION = "3.13"
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/version.txt"
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/Admin.py"
 READ_PUSH_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/ReadPush.py"
@@ -877,18 +877,24 @@ class AdminApp:
     @staticmethod
     def print_completion_summary(
         delivery: str,
+        completed: int,
         incomplete: list[str],
         cancelled: list[str],
     ) -> None:
         """Print exactly one coloured completion line for one delivery type."""
         console = Console()
         if incomplete:
+            active_total = completed + len(incomplete)
             message = (
-                f"! {delivery}: incomplete orders: {', '.join(incomplete)}."
+                f"! {delivery} ({completed}/{active_total} completed): "
+                f"incomplete orders: {', '.join(incomplete)}."
             )
             colour = "bold red"
         else:
-            message = f"✓ {delivery}: all orders are completed."
+            message = (
+                f"✓ {delivery} ({completed} completed): "
+                "all orders are completed."
+            )
             colour = "bold green"
 
         if cancelled:
@@ -902,9 +908,9 @@ class AdminApp:
             return
 
         results = {
-            "UPS": {"incomplete": [], "cancelled": []},
-            "Packeta": {"incomplete": [], "cancelled": []},
-            "Postal": {"incomplete": [], "cancelled": []},
+            "UPS": {"completed": [], "incomplete": [], "cancelled": []},
+            "Packeta": {"completed": [], "incomplete": [], "cancelled": []},
+            "Postal": {"completed": [], "incomplete": [], "cancelled": []},
         }
 
         for line in lines:
@@ -922,7 +928,10 @@ class AdminApp:
 
             status_suffix = line[order_match.end():]
             assembled, packed = statistics_order_progress(status_suffix)
-            if (not assembled or not packed) and order_id not in status["incomplete"]:
+            if assembled and packed:
+                if order_id not in status["completed"]:
+                    status["completed"].append(order_id)
+            elif order_id not in status["incomplete"]:
                 status["incomplete"].append(order_id)
 
         display_names = {
@@ -934,6 +943,7 @@ class AdminApp:
             status = results[delivery]
             self.print_completion_summary(
                 display_names[delivery],
+                len(status["completed"]),
                 status["incomplete"],
                 status["cancelled"],
             )
