@@ -38,10 +38,13 @@ REQUIRED_PACKAGES = [
     ("cv2", "opencv-python"),
     ("dymo_sdk", "dymo-sdk"),
     ("pdfplumber", "pdfplumber"),
+    ("PIL", "Pillow"),
     ("playwright", "playwright"),
+    ("pyautogui", "PyAutoGUI"),
     ("pypdf", "pypdf"),
     ("pygame", "pygame"),
     ("pygrabber", "pygrabber"),
+    ("numpy", "numpy"),
     ("rapidfuzz", "rapidfuzz"),
     ("requests", "requests"),
     ("rich", "rich"),
@@ -79,17 +82,33 @@ from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "Admin_settings.json"
-CURRENT_VERSION = "3.13"
+CURRENT_VERSION = "3.17"
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/version.txt"
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/Admin.py"
 READ_PUSH_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/ReadPush.py"
 FINISH_ORDERS_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/FinishOrders.py"
+PATTERN_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/pattern.png"
+CHECKBOX_PATTERN_URL = (
+    "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/checkbox.png"
+)
+SENT_PENDING_PATTERN_URL = (
+    "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/sent%26pending.png"
+)
+SENT_PAID_PATTERN_URL = (
+    "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/sent%26paid.png"
+)
 MUTEX_NAME = "GreenPoAdminProgramMutex"
 
 STATISTICS_PART_HEADER_PATTERN = re.compile(
     r"-+\s*\d{2}\.\d{2}\.\d{4}\s+Part\s+(\d+)\.pdf\s*-+",
     re.IGNORECASE,
 )
+
+
+class FinishOrderValidationError(RuntimeError):
+    """The website order does not satisfy the statistics requirements."""
+
+
 STATISTICS_ANY_ORDER_PATTERN = re.compile(r"(?<!\S)#\d+(?=\s|$)")
 UPS_TRACKING_PATTERN = re.compile(r"^1ZR", re.IGNORECASE)
 PACKETA_TRACKING_PATTERN = re.compile(r"^Z\d{5,}(?=\s|$)", re.IGNORECASE)
@@ -101,6 +120,10 @@ CHANGE_LABEL_SOURCE_PATTERN = re.compile(
 COMPANION_FILES = {
     "ReadPush.py": READ_PUSH_URL,
     "FinishOrders.py": FINISH_ORDERS_URL,
+    "pattern.png": PATTERN_URL,
+    "checkbox.png": CHECKBOX_PATTERN_URL,
+    "sent&pending.png": SENT_PENDING_PATTERN_URL,
+    "sent&paid.png": SENT_PAID_PATTERN_URL,
 }
 
 SETTINGS_DEFAULTS = {
@@ -147,10 +170,58 @@ SETTINGS_DEFAULTS = {
     "FINISH_ORDERS": {
         "site_url": "",
         "browser_channel": "chrome",
+        "window_title_contains": "Fast Buds Autoflowering Cannabis Seeds",
+        "dropdown_pattern": "pattern.png",
+        "pattern_confidence": 0.95,
+        "checkbox_pattern": "checkbox.png",
+        "red_action_pattern": "sent&pending.png",
+        "green_action_pattern": "sent&paid.png",
+        "menu_pattern_confidence": 0.90,
+        "menu_pattern_edge_inset": 1,
+        "menu_pattern_scroll_distance": 300,
+        "menu_pattern_scroll_attempts": 5,
+        "menu_pattern_scroll_settle_delay": 0.35,
+        "selection_start_offset": 100,
+        "selection_vertical_offset": -10,
+        "selection_drag_distance": 60,
+        "selection_drag_duration": 0.8,
+        "clipboard_text_path": "FinishOrders_clipboard.txt",
+        "clipboard_html_path": "FinishOrders_clipboard.html",
+        "checkbox_vertical_offset": 107,
+        "dropdown_edge_inset": 2,
+        "mouse_move_duration_min": 0.25,
+        "mouse_move_duration_max": 0.75,
+        "mouse_speed_multiplier": 2.0,
+        "click_delay_min": 0.2,
+        "click_delay_max": 1.0,
+        "click_delay_scale": 0.5,
+        "enter_delay_min": 0.0,
+        "enter_delay_max": 1.0,
+        "notification_top_min": 140,
+        "notification_top_max": 170,
+        "notification_right_min": 50,
+        "notification_right_max": 250,
+        "notification_timeout": 5.0,
+        "notification_settle_delay": 0.25,
+        "notification_change_threshold": 18,
+        "notification_changed_ratio": 0.03,
+        "notification_red_score_threshold": 0.12,
+        "red_refresh_wait": 5.0,
+        "automatic_mode_hold_seconds": 2.0,
         "browser_profile": "BrowserProfile",
         "logs_folder": "~/Desktop/FinishOrdersLogs",
     },
     "ORDERS": {},
+}
+
+LEGACY_FINISH_PATTERN_PATHS = {
+    "dropdown_pattern": ("~/Desktop/pattern.png", "pattern.png"),
+    "checkbox_pattern": ("~/Desktop/checkbox.png", "checkbox.png"),
+    "red_action_pattern": (
+        "~/Desktop/sent&pending.png",
+        "sent&pending.png",
+    ),
+    "green_action_pattern": ("~/Desktop/sent&paid.png", "sent&paid.png"),
 }
 
 
@@ -174,25 +245,54 @@ def load_settings(path: Path = SETTINGS_PATH) -> dict:
     return settings
 
 
-def add_missing_setting_values(current: dict, defaults: dict) -> list[str]:
-    """Add missing nested defaults while preserving every configured value."""
+def synchronize_setting_values(
+    current: dict,
+    defaults: dict,
+    prefix: str,
+) -> tuple[dict, list[str], list[str], list[str]]:
+    """Return an independent copy aligned recursively with one settings schema."""
+    synchronized: dict = {}
     added: list[str] = []
+    removed: list[str] = []
+    replaced: list[str] = []
+
     for key, default_value in defaults.items():
+        setting_name = f"{prefix}.{key}" if prefix else key
         if key not in current:
-            current[key] = deepcopy(default_value)
-            added.append(key)
-        elif isinstance(default_value, dict) and isinstance(current[key], dict):
-            added.extend(
-                f"{key}.{nested_key}"
-                for nested_key in add_missing_setting_values(
-                    current[key], default_value
+            synchronized[key] = deepcopy(default_value)
+            added.append(setting_name)
+            continue
+
+        configured_value = current[key]
+        if isinstance(default_value, dict):
+            if not isinstance(configured_value, dict):
+                synchronized[key] = deepcopy(default_value)
+                replaced.append(setting_name)
+                continue
+            nested, nested_added, nested_removed, nested_replaced = (
+                synchronize_setting_values(
+                    configured_value,
+                    default_value,
+                    setting_name,
                 )
             )
-    return added
+            synchronized[key] = nested
+            added.extend(nested_added)
+            removed.extend(nested_removed)
+            replaced.extend(nested_replaced)
+        else:
+            synchronized[key] = deepcopy(configured_value)
+
+    removed.extend(
+        f"{prefix}.{key}" if prefix else key
+        for key in current
+        if key not in defaults
+    )
+    return synchronized, added, removed, replaced
 
 
 def synchronize_settings(path: Path = SETTINGS_PATH) -> dict:
-    """Synchronize Admin settings sections without replacing local values."""
+    """Synchronize the JSON file with the current settings schema."""
     if path.exists():
         try:
             settings = json.loads(path.read_text(encoding="utf-8"))
@@ -205,21 +305,28 @@ def synchronize_settings(path: Path = SETTINGS_PATH) -> dict:
     else:
         settings = {}
 
-    synchronized: dict = {}
-    added: list[str] = []
-    for section, defaults in SETTINGS_DEFAULTS.items():
-        existing = settings.get(section)
-        if not isinstance(existing, dict):
-            existing = deepcopy(defaults)
-            added.append(section)
-        else:
-            added.extend(
-                f"{section}.{key}"
-                for key in add_missing_setting_values(existing, defaults)
-            )
-        synchronized[section] = existing
+    synchronized, added, removed, replaced = synchronize_setting_values(
+        settings,
+        SETTINGS_DEFAULTS,
+        "",
+    )
 
-    removed = [key for key in settings if key not in SETTINGS_DEFAULTS]
+    # Product mappings are intentionally user-managed and have no fixed keys.
+    existing_orders = settings.get("ORDERS")
+    if isinstance(existing_orders, dict):
+        synchronized["ORDERS"] = deepcopy(existing_orders)
+        removed = [
+            name for name in removed if not name.startswith("ORDERS.")
+        ]
+    migrated: list[str] = []
+    finish_settings = synchronized.get("FINISH_ORDERS", {})
+    if isinstance(finish_settings, dict):
+        for key, (legacy_value, current_value) in (
+            LEGACY_FINISH_PATTERN_PATHS.items()
+        ):
+            if finish_settings.get(key) == legacy_value:
+                finish_settings[key] = current_value
+                migrated.append(f"FINISH_ORDERS.{key}")
     if synchronized != settings:
         temporary = path.with_name(f".{path.name}.tmp")
         try:
@@ -237,6 +344,10 @@ def synchronize_settings(path: Path = SETTINGS_PATH) -> dict:
             changes.append(f"added: {', '.join(added)}")
         if removed:
             changes.append(f"removed: {', '.join(removed)}")
+        if replaced:
+            changes.append(f"replaced invalid objects: {', '.join(replaced)}")
+        if migrated:
+            changes.append(f"migrated: {', '.join(migrated)}")
         print(f"* {path.name} synchronized ({'; '.join(changes)})")
 
     return synchronized
@@ -373,7 +484,7 @@ def download_file(url: str, destination: Path, *, timeout: int = 15) -> None:
 
 
 def ensure_companion_files() -> None:
-    """Install optional program files that were added after an Admin update."""
+    """Install every missing companion module or image asset at startup."""
     for filename, url in COMPANION_FILES.items():
         destination = BASE_DIR / filename
         if destination.is_file():
@@ -472,7 +583,10 @@ class AdminApp:
         self.print_lock = threading.Lock()
         self.statistics_lock = threading.Lock()
         self.audio: dict[str, pygame.mixer.Sound] = {}
-        self.finish_orders_process: subprocess.Popen | None = None
+        self.finish_orders_active = False
+        self.finish_orders_lock = threading.Lock()
+        self.finish_orders_cancel_event = threading.Event()
+        self.finish_orders_ignored_dropdowns = 0
 
         paths = settings["PATHS"]
         self.desktop = Path.home() / "Desktop"
@@ -663,7 +777,9 @@ class AdminApp:
         if command.casefold() == "help":
             print("print part N     - print today's order PDF Part N")
             print("send part N      - send today's Label PDF Part N")
-            print("finish part N    - open the order-finishing website for Part N")
+            print("finish part N    - finish orders from today's network statistics")
+            print("  Right Arrow    - next order; hold 2 seconds for automatic mode")
+            print("  Space          - stop the finish cycle and automatic mode")
             print("cancel [#]1234567  - mark an order Cancelled")
             print("copy [#]1234567    - copy matching photos to Desktop")
             print("check               - check completion of today's orders")
@@ -715,6 +831,397 @@ class AdminApp:
 
         print("! Unknown command. Type: help")
 
+    @staticmethod
+    def clipboard_order_number(clipboard_text: str) -> str:
+        """Read the first order-sized number from the first non-empty line."""
+        first_line = next(
+            (line for line in clipboard_text.splitlines() if line.strip()),
+            "",
+        )
+        match = re.search(r"(?<!\d)#?(\d{5,})(?!\d)", first_line)
+        if match is None:
+            raise FinishOrderValidationError(
+                "The first non-empty clipboard line does not contain an order number"
+            )
+        return match.group(1)
+
+    @staticmethod
+    def normalized_customer_name(value: str) -> str:
+        return " ".join(value.split()).casefold()
+
+    def validate_finish_order(
+        self,
+        clipboard_text: str,
+        part_number: int,
+    ) -> dict:
+        """Validate one website row against today's network statistics."""
+        statistics_path = self.statistics_path()
+        try:
+            lines = statistics_path.read_text(encoding="utf-8-sig").splitlines()
+        except OSError as error:
+            raise RuntimeError(
+                f"Cannot read finish statistics {statistics_path}: {error}"
+            ) from error
+
+        order_number = self.clipboard_order_number(clipboard_text)
+        requested_order = f"#{order_number}"
+        current_part: int | None = None
+        part_found = False
+        order_line = ""
+        order_match: re.Match[str] | None = None
+
+        for line in lines:
+            header = STATISTICS_PART_HEADER_PATTERN.search(line)
+            if header is not None:
+                current_part = int(header.group(1))
+                if current_part == part_number:
+                    part_found = True
+                elif part_found:
+                    break
+                continue
+            if current_part != part_number:
+                continue
+            match = statistics_order_match(line, requested_order)
+            if match is not None:
+                order_line = line
+                order_match = match
+                break
+
+        if not part_found:
+            raise RuntimeError(
+                f"Part {part_number} was not found in {statistics_path.name}"
+            )
+        if order_match is None:
+            raise FinishOrderValidationError(
+                f"Order {requested_order} was not found in Part {part_number}"
+            )
+
+        prefix = order_line[: order_match.start()].strip()
+        tracking_and_customer = prefix.split(maxsplit=1)
+        if prefix.casefold().startswith("1zr") or PACKETA_TRACKING_PATTERN.match(prefix):
+            customer_name = (
+                tracking_and_customer[1] if len(tracking_and_customer) == 2 else ""
+            )
+        else:
+            customer_name = prefix
+        customer_name = " ".join(customer_name.split())
+        if not customer_name:
+            raise FinishOrderValidationError(
+                f"CustomerName is empty for {requested_order} in statistics"
+            )
+
+        normalized_clipboard = self.normalized_customer_name(clipboard_text)
+        normalized_customer = self.normalized_customer_name(customer_name)
+        if normalized_customer not in normalized_clipboard:
+            raise FinishOrderValidationError(
+                f"CustomerName mismatch for {requested_order}: statistics has "
+                f"'{customer_name}'"
+            )
+
+        status_suffix = order_line[order_match.end():]
+        if re.search(r"(?<!\w)Cancelled(?!\w)", status_suffix, re.IGNORECASE):
+            raise FinishOrderValidationError(f"Order {requested_order} is Cancelled")
+        assembled, packed = statistics_order_progress(status_suffix)
+        if not assembled:
+            raise FinishOrderValidationError(f"Order {requested_order} is not assembled")
+        if not packed:
+            raise FinishOrderValidationError(f"Order {requested_order} is not packed")
+
+        return {
+            "order_id": requested_order,
+            "customer_name": customer_name,
+            "statistics_path": str(statistics_path),
+        }
+
+    def activate_finish_orders_browser(self, part_number: int) -> bool:
+        """Validate and prepare exactly one website order for finishing."""
+        try:
+            from FinishOrders import (
+                confirm_checkbox_and_mark_action,
+                configure_cancel_check,
+                configure_interaction_timing,
+                open_dropdown_and_mark_checkbox,
+                scan_dropdown_patterns,
+                select_and_copy_order,
+            )
+
+            configuration = self.settings.get("FINISH_ORDERS", {})
+            configure_cancel_check(self.finish_orders_cancel_event.is_set)
+            click_delay_scale = float(
+                configuration.get("click_delay_scale", 0.5)
+            )
+            if click_delay_scale < 0:
+                raise ValueError("click_delay_scale cannot be negative")
+            mouse_speed_multiplier = float(
+                configuration.get("mouse_speed_multiplier", 2.0)
+            )
+            if mouse_speed_multiplier <= 0:
+                raise ValueError("mouse_speed_multiplier must be greater than zero")
+            configure_interaction_timing(
+                mouse_move_min=float(
+                    configuration.get("mouse_move_duration_min", 0.25)
+                ) / mouse_speed_multiplier,
+                mouse_move_max=float(
+                    configuration.get("mouse_move_duration_max", 0.75)
+                ) / mouse_speed_multiplier,
+                click_delay_min=float(
+                    configuration.get("click_delay_min", 0.2)
+                ) * click_delay_scale,
+                click_delay_max=float(
+                    configuration.get("click_delay_max", 1.0)
+                ) * click_delay_scale,
+                enter_delay_min=float(
+                    configuration.get("enter_delay_min", 0.0)
+                ),
+                enter_delay_max=float(
+                    configuration.get("enter_delay_max", 1.0)
+                ),
+            )
+            title_fragment = str(
+                configuration.get(
+                    "window_title_contains",
+                    "Fast Buds Autoflowering Cannabis Seeds",
+                )
+            ).strip()
+            result = scan_dropdown_patterns(
+                title_fragment=title_fragment,
+                pattern_path=str(
+                    configuration.get(
+                        "dropdown_pattern",
+                        "pattern.png",
+                    )
+                ),
+                confidence=float(
+                    configuration.get("pattern_confidence", 0.95)
+                ),
+            )
+            print(f"* Finishing browser activated: {result['title']}")
+            print(f"* Dropdown patterns found: {len(result['matches'])}")
+            if not result["matches"]:
+                print("! Selection skipped because no dropdown pattern was found")
+                return False
+
+            while self.finish_orders_ignored_dropdowns < len(result["matches"]):
+                dropdown_index = self.finish_orders_ignored_dropdowns
+                selected_match = result["matches"][dropdown_index]
+                print(f"* Selecting website Dropdown {dropdown_index + 1}...")
+                drag_distance = int(
+                    configuration.get("selection_drag_distance", 60)
+                )
+                clipboard = select_and_copy_order(
+                    selected_match,
+                    start_offset=int(
+                        configuration.get("selection_start_offset", 100)
+                    ),
+                    vertical_offset=int(
+                        configuration.get("selection_vertical_offset", -10)
+                    ),
+                    drag_distance=drag_distance,
+                    drag_duration=float(
+                        configuration.get("selection_drag_duration", 0.8)
+                    ) / mouse_speed_multiplier,
+                    text_path=str(
+                        configuration.get(
+                            "clipboard_text_path",
+                            "FinishOrders_clipboard.txt",
+                        )
+                    ),
+                    html_path=str(
+                        configuration.get(
+                            "clipboard_html_path",
+                            "FinishOrders_clipboard.html",
+                        )
+                    ),
+                )
+                print(
+                    f"* Selection: ({clipboard['start_x']}, "
+                    f"{clipboard['start_y']}) -> ({clipboard['end_x']}, "
+                    f"{clipboard['end_y']})"
+                )
+                print("* Clipboard text:")
+                print(clipboard["text"] or "<empty>")
+                print(f"* Price: {clipboard['price'] or 'not detected'}")
+                print(
+                    f"* Price colour: {clipboard['price_colour']} "
+                    f"({clipboard['colour_source']})"
+                )
+                try:
+                    validated = self.validate_finish_order(
+                        clipboard["text"],
+                        part_number,
+                    )
+                except FinishOrderValidationError as error:
+                    Console().print(
+                        f"! Dropdown {dropdown_index + 1} ignored: "
+                        f"{error}",
+                        style="bold yellow",
+                    )
+                    self.finish_orders_ignored_dropdowns += 1
+                    continue
+                break
+            else:
+                print("! No non-ignored Dropdown remains on the current screen")
+                return False
+
+            Console().print(
+                f"✓ {validated['order_id']} — {validated['customer_name']}: "
+                "assembled, packed and ready.",
+                style="bold green",
+            )
+            dropdown = open_dropdown_and_mark_checkbox(
+                selected_match,
+                result["window_rectangle"],
+                checkbox_pattern_path=str(
+                    configuration.get(
+                        "checkbox_pattern",
+                        "checkbox.png",
+                    )
+                ),
+                pattern_confidence=float(
+                    configuration.get("menu_pattern_confidence", 0.90)
+                ),
+                pattern_edge_inset=int(
+                    configuration.get("menu_pattern_edge_inset", 1)
+                ),
+                dropdown_edge_inset=int(
+                    configuration.get("dropdown_edge_inset", 2)
+                ),
+                scroll_distance=int(
+                    configuration.get("menu_pattern_scroll_distance", 300)
+                ),
+                scroll_attempts=int(
+                    configuration.get("menu_pattern_scroll_attempts", 5)
+                ),
+                scroll_settle_delay=float(
+                    configuration.get(
+                        "menu_pattern_scroll_settle_delay",
+                        0.35,
+                    )
+                ),
+            )
+            print(
+                f"* Dropdown opened at ({dropdown['dropdown_x']}, "
+                f"{dropdown['dropdown_y']})"
+            )
+            print(
+                f"* Checkbox pattern target: ({dropdown['checkbox_x']}, "
+                f"{dropdown['checkbox_y']}), scrolls: "
+                f"{dropdown['checkbox_scroll_count']}"
+            )
+
+            action = confirm_checkbox_and_mark_action(
+                selected_match,
+                dropdown,
+                result["window_rectangle"],
+                price_colour=clipboard["price_colour"],
+                checkbox_vertical_offset=int(
+                    configuration.get("checkbox_vertical_offset", 107)
+                ),
+                dropdown_pattern_path=str(
+                    configuration.get("dropdown_pattern", "pattern.png")
+                ),
+                red_action_pattern_path=str(
+                    configuration.get(
+                        "red_action_pattern",
+                        "sent&pending.png",
+                    )
+                ),
+                green_action_pattern_path=str(
+                    configuration.get(
+                        "green_action_pattern",
+                        "sent&paid.png",
+                    )
+                ),
+                pattern_confidence=float(
+                    configuration.get("menu_pattern_confidence", 0.90)
+                ),
+                pattern_edge_inset=int(
+                    configuration.get("menu_pattern_edge_inset", 1)
+                ),
+                dropdown_edge_inset=int(
+                    configuration.get("dropdown_edge_inset", 2)
+                ),
+                scroll_distance=int(
+                    configuration.get("menu_pattern_scroll_distance", 300)
+                ),
+                scroll_attempts=int(
+                    configuration.get("menu_pattern_scroll_attempts", 5)
+                ),
+                scroll_settle_delay=float(
+                    configuration.get(
+                        "menu_pattern_scroll_settle_delay",
+                        0.35,
+                    )
+                ),
+                notification_top_min=int(
+                    configuration.get("notification_top_min", 140)
+                ),
+                notification_top_max=int(
+                    configuration.get("notification_top_max", 170)
+                ),
+                notification_right_min=int(
+                    configuration.get("notification_right_min", 50)
+                ),
+                notification_right_max=int(
+                    configuration.get("notification_right_max", 250)
+                ),
+                notification_timeout=float(
+                    configuration.get("notification_timeout", 5.0)
+                ),
+                notification_settle_delay=float(
+                    configuration.get("notification_settle_delay", 0.25)
+                ),
+                notification_change_threshold=int(
+                    configuration.get("notification_change_threshold", 18)
+                ),
+                notification_changed_ratio=float(
+                    configuration.get("notification_changed_ratio", 0.03)
+                ),
+                notification_red_score_threshold=float(
+                    configuration.get("notification_red_score_threshold", 0.12)
+                ),
+                red_refresh_wait=float(
+                    configuration.get("red_refresh_wait", 5.0)
+                ),
+            )
+            print("* Checkbox clicked and confirmed with Enter")
+            print("* Dropdown reopened")
+            print(
+                f"* {action['price_colour'].capitalize()} action target: "
+                f"({action['action_x']}, {action['action_y']}), pattern: "
+                f"{action['action_pattern']}, scrolls: "
+                f"{action['action_scroll_count']}"
+            )
+            print("* Final action clicked and confirmed with Enter")
+            print(
+                f"* Result notification: {action['notification_colour']} "
+                f"(red score {action['notification_red_score']:.1%}, "
+                f"changed {action['notification_changed_ratio']:.1%})"
+            )
+            print(
+                f"* Result notification clicked at "
+                f"({action['notification_x']}, {action['notification_y']})"
+            )
+            if action["notification_colour"] == "red":
+                self.finish_orders_ignored_dropdowns += 1
+                Console().print(
+                    "! Red result: page refreshed; this Dropdown will be "
+                    "ignored.",
+                    style="bold red",
+                )
+            else:
+                Console().print(
+                    "✓ Green result: order finished successfully.",
+                    style="bold green",
+                )
+            return True
+        except Exception as error:
+            if self.finish_orders_cancel_event.is_set():
+                print("* FinishOrders cycle stopped by Space")
+                return False
+            print(f"! Finish order skipped: {error}")
+            return False
+
     def print_part_manual(self, part_number: int) -> None:
         today = datetime.now().strftime("%d.%m.%Y")
         pdf_path = self.downloads / f"{today} Part {part_number}.pdf"
@@ -739,34 +1246,143 @@ class AdminApp:
         print(f"* Label send job accepted: {label_path.name}")
 
     def finish_part_manual(self, part_number: int) -> None:
-        """Open the first-stage finishing browser without blocking Admin."""
-        if (
-            self.finish_orders_process is not None
-            and self.finish_orders_process.poll() is None
-        ):
-            print("! FinishOrders is already running; close its browser first")
+        """Start a key-stepped finishing session without blocking the console."""
+        with self.finish_orders_lock:
+            if self.finish_orders_active:
+                print("! A finish part session is already active")
+                return
+            self.finish_orders_active = True
+            self.finish_orders_cancel_event.clear()
+            self.finish_orders_ignored_dropdowns = 0
+
+        statistics_path = self.statistics_path()
+        try:
+            if not statistics_path.is_file():
+                raise FileNotFoundError(statistics_path)
+        except OSError as error:
+            with self.finish_orders_lock:
+                self.finish_orders_active = False
+            print(f"! Today's network statistics file is unavailable: {error}")
             return
 
-        script_path = BASE_DIR / "FinishOrders.py"
-        if not script_path.is_file():
-            print("! FinishOrders.py is missing; restart Admin to download it")
-            return
+        self._start_thread(
+            lambda: self.finish_part_key_session(part_number),
+            f"finish Part {part_number}",
+        )
+        print(f"* FinishOrders started for Part {part_number}")
+
+    def finish_part_key_session(self, part_number: int) -> None:
+        """Run manual steps or switch to continuous mode by holding Right."""
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+        user32.GetAsyncKeyState.restype = ctypes.c_short
+        vk_right = 0x27
+        configuration = self.settings.get("FINISH_ORDERS", {})
 
         try:
-            self.finish_orders_process = subprocess.Popen(
-                [
-                    sys.executable,
-                    str(script_path),
-                    "--part",
-                    str(part_number),
-                    "--settings",
-                    str(SETTINGS_PATH),
-                ],
-                cwd=str(BASE_DIR),
+            automatic_hold_seconds = float(
+                configuration.get("automatic_mode_hold_seconds", 2.0)
             )
-            print(f"* FinishOrders started for Part {part_number}")
+            if automatic_hold_seconds <= 0:
+                raise ValueError(
+                    "automatic_mode_hold_seconds must be greater than zero"
+                )
+            stop_key_thread = threading.Thread(
+                target=self.monitor_finish_stop_key,
+                args=(user32,),
+                name="finish Space listener",
+                daemon=True,
+            )
+            stop_key_thread.start()
+            print(f"* Network statistics: {self.statistics_path()}")
+            first_order_finished = self.activate_finish_orders_browser(part_number)
+            if self.finish_orders_cancel_event.is_set():
+                return
+            if not first_order_finished:
+                print("* FinishOrders stopped: no order was found")
+                return
+
+            print(
+                "* Release Right Arrow for one order, or hold it for "
+                f"{automatic_hold_seconds:g} seconds to enable automatic mode"
+            )
+            automatic_mode = False
+            right_down_since: float | None = (
+                time.monotonic()
+                if user32.GetAsyncKeyState(vk_right) & 0x8000
+                else None
+            )
+            while (
+                not self.finish_orders_cancel_event.is_set()
+                and not self.stop_event.wait(0.03)
+            ):
+                if automatic_mode:
+                    order_finished = self.activate_finish_orders_browser(part_number)
+                    if self.finish_orders_cancel_event.is_set():
+                        return
+                    if not order_finished:
+                        print(
+                            "* Automatic mode stopped: the next order was not found"
+                        )
+                        return
+                    continue
+
+                is_down = bool(user32.GetAsyncKeyState(vk_right) & 0x8000)
+                if is_down:
+                    if right_down_since is None:
+                        right_down_since = time.monotonic()
+                    elif (
+                        time.monotonic() - right_down_since
+                        >= automatic_hold_seconds
+                    ):
+                        automatic_mode = True
+                        Console().print(
+                            "▶ Automatic finish mode enabled",
+                            style="bold cyan",
+                        )
+                    continue
+
+                if right_down_since is not None:
+                    held_seconds = time.monotonic() - right_down_since
+                    right_down_since = None
+                    if held_seconds >= automatic_hold_seconds:
+                        automatic_mode = True
+                        Console().print(
+                            "▶ Automatic finish mode enabled",
+                            style="bold cyan",
+                        )
+                        continue
+                    order_finished = self.activate_finish_orders_browser(part_number)
+                    if self.finish_orders_cancel_event.is_set():
+                        return
+                    if not order_finished:
+                        print("* FinishOrders stopped: the next order was not found")
+                        return
+                    print(
+                        "* Release Right Arrow for one order, or hold it for "
+                        f"{automatic_hold_seconds:g} seconds to enable "
+                        "automatic mode"
+                    )
         except Exception as error:
-            print(f"! Cannot start FinishOrders: {error}")
+            print(f"! FinishOrders session stopped: {error}")
+        finally:
+            with self.finish_orders_lock:
+                self.finish_orders_active = False
+
+    def monitor_finish_stop_key(self, user32) -> None:
+        """Stop the active finish session as soon as Space is pressed."""
+        vk_space = 0x20
+        was_down = bool(user32.GetAsyncKeyState(vk_space) & 0x8000)
+        while not self.stop_event.wait(0.02):
+            with self.finish_orders_lock:
+                if not self.finish_orders_active:
+                    return
+            is_down = bool(user32.GetAsyncKeyState(vk_space) & 0x8000)
+            if not was_down and is_down:
+                self.finish_orders_cancel_event.set()
+                print("* Space pressed — automatic mode and FinishOrders stopping")
+                return
+            was_down = is_down
 
     def copy_with_retry(self, file_path: Path) -> None:
         network_folder = Path(self.settings["NETWORK"]["downloads"])
