@@ -935,8 +935,6 @@ def select_and_copy_order(
     vertical_offset: int,
     drag_distance: int,
     drag_duration: float,
-    text_path: str,
-    html_path: str,
 ) -> dict:
     """Select one order row vertically, copy it and inspect clipboard formats."""
     if start_offset < 0 or drag_distance <= 0:
@@ -974,12 +972,6 @@ def select_and_copy_order(
     plain_text, html, format_names = read_clipboard()
     if not plain_text and not html:
         raise RuntimeError("The copied selection did not contain text or HTML")
-    resolved_text = configured_path(text_path)
-    resolved_html = configured_path(html_path)
-    resolved_text.parent.mkdir(parents=True, exist_ok=True)
-    resolved_html.parent.mkdir(parents=True, exist_ok=True)
-    resolved_text.write_text(plain_text, encoding="utf-8")
-    resolved_html.write_text(html, encoding="utf-8")
 
     price, price_colour, colour_source = detect_price_and_colour(
         plain_text,
@@ -996,8 +988,6 @@ def select_and_copy_order(
         "price": price,
         "price_colour": price_colour,
         "colour_source": colour_source,
-        "text_path": str(resolved_text),
-        "html_path": str(resolved_html),
     }
 
 

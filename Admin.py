@@ -185,8 +185,6 @@ SETTINGS_DEFAULTS = {
         "selection_vertical_offset": -10,
         "selection_drag_distance": 60,
         "selection_drag_duration": 0.8,
-        "clipboard_text_path": "FinishOrders_clipboard.txt",
-        "clipboard_html_path": "FinishOrders_clipboard.html",
         "checkbox_vertical_offset": 107,
         "dropdown_edge_inset": 2,
         "mouse_move_duration_min": 0.25,
@@ -1020,18 +1018,6 @@ class AdminApp:
                     drag_duration=float(
                         configuration.get("selection_drag_duration", 0.8)
                     ) / mouse_speed_multiplier,
-                    text_path=str(
-                        configuration.get(
-                            "clipboard_text_path",
-                            "FinishOrders_clipboard.txt",
-                        )
-                    ),
-                    html_path=str(
-                        configuration.get(
-                            "clipboard_html_path",
-                            "FinishOrders_clipboard.html",
-                        )
-                    ),
                 )
                 print(
                     f"* Selection: ({clipboard['start_x']}, "
