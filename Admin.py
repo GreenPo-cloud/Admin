@@ -97,6 +97,12 @@ SENT_PENDING_PATTERN_URL = (
 SENT_PAID_PATTERN_URL = (
     "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/sent%26paid.png"
 )
+ORDER_IS_SENT_PATTERN_URL = (
+    "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/OrderIsSent.png"
+)
+COMPLETE_PATTERN_URL = (
+    "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/Complete.png"
+)
 MUTEX_NAME = "GreenPoAdminProgramMutex"
 
 STATISTICS_PART_HEADER_PATTERN = re.compile(
@@ -124,6 +130,8 @@ COMPANION_FILES = {
     "checkbox.png": CHECKBOX_PATTERN_URL,
     "sent&pending.png": SENT_PENDING_PATTERN_URL,
     "sent&paid.png": SENT_PAID_PATTERN_URL,
+    "OrderIsSent.png": ORDER_IS_SENT_PATTERN_URL,
+    "Complete.png": COMPLETE_PATTERN_URL,
 }
 
 SETTINGS_DEFAULTS = {
@@ -176,6 +184,10 @@ SETTINGS_DEFAULTS = {
         "checkbox_pattern": "checkbox.png",
         "red_action_pattern": "sent&pending.png",
         "green_action_pattern": "sent&paid.png",
+        "order_is_sent_notification_pattern": "OrderIsSent.png",
+        "complete_notification_pattern": "Complete.png",
+        "notification_pattern_confidence": 0.60,
+        "notification_pattern_edge_inset": 3,
         "menu_pattern_confidence": 0.90,
         "menu_pattern_edge_inset": 1,
         "menu_pattern_scroll_distance": 300,
@@ -1139,6 +1151,24 @@ class AdminApp:
                         0.35,
                     )
                 ),
+                order_is_sent_notification_pattern_path=str(
+                    configuration.get(
+                        "order_is_sent_notification_pattern",
+                        "OrderIsSent.png",
+                    )
+                ),
+                complete_notification_pattern_path=str(
+                    configuration.get(
+                        "complete_notification_pattern",
+                        "Complete.png",
+                    )
+                ),
+                notification_pattern_confidence=float(
+                    configuration.get("notification_pattern_confidence", 0.60)
+                ),
+                notification_pattern_edge_inset=int(
+                    configuration.get("notification_pattern_edge_inset", 3)
+                ),
                 notification_top_min=int(
                     configuration.get("notification_top_min", 140)
                 ),
@@ -1171,6 +1201,13 @@ class AdminApp:
                 ),
             )
             print("* Checkbox clicked and confirmed with Enter")
+            print(
+                f"* Is Sent notification ({action['sent_notification_pattern']}) "
+                f"clicked at ({action['sent_notification_x']}, "
+                f"{action['sent_notification_y']}); source: "
+                f"{action['sent_notification_source']}, confidence: "
+                f"{action['sent_notification_confidence']:.1%}"
+            )
             print("* Dropdown reopened")
             print(
                 f"* {action['price_colour'].capitalize()} action target: "
@@ -1180,8 +1217,11 @@ class AdminApp:
             )
             print("* Final action clicked and confirmed with Enter")
             print(
-                f"* Result notification: {action['notification_colour']} "
-                f"(red score {action['notification_red_score']:.1%}, "
+                f"* Result notification ({action['notification_pattern']}): "
+                f"{action['notification_colour']} via "
+                f"{action['notification_source']} "
+                f"(confidence {action['notification_confidence']:.1%}, "
+                f"red score {action['notification_red_score']:.1%}, "
                 f"changed {action['notification_changed_ratio']:.1%})"
             )
             print(

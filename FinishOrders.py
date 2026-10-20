@@ -465,8 +465,10 @@ def scan_pattern_matches(
     window_bounds: tuple[int, int, int, int],
     pattern_path: str,
     confidence: float,
+    *,
+    edge_match: bool = False,
 ) -> list[dict]:
-    """Capture one window in memory and return all template matches."""
+    """Capture one window and return colour or edge-template matches."""
     import cv2
     import numpy as np
     from PIL import ImageGrab
@@ -499,9 +501,24 @@ def scan_pattern_matches(
             f"Pattern {resolved_pattern.name} is larger than the Chrome capture"
         )
 
+    if edge_match:
+        screenshot_source = cv2.Canny(
+            cv2.cvtColor(screenshot_bgr, cv2.COLOR_BGR2GRAY),
+            45,
+            135,
+        )
+        template_source = cv2.Canny(
+            cv2.cvtColor(template, cv2.COLOR_BGR2GRAY),
+            45,
+            135,
+        )
+    else:
+        screenshot_source = screenshot_bgr
+        template_source = template
+
     scores = cv2.matchTemplate(
-        screenshot_bgr,
-        template,
+        screenshot_source,
+        template_source,
         cv2.TM_CCOEFF_NORMED,
     )
     threshold_mask = (scores >= confidence).astype(np.uint8)
@@ -526,10 +543,36 @@ def scan_pattern_matches(
                 "center_y": top + local_y + template_height // 2,
                 "confidence": float(scores[local_y, local_x]),
                 "pattern_path": str(resolved_pattern),
+                "match_mode": "edges" if edge_match else "colour",
             }
         )
     raise_if_cancelled()
     return sorted(matches, key=lambda item: (-item["confidence"], item["top"]))
+
+
+def wait_for_pattern(
+    window_bounds: tuple[int, int, int, int],
+    pattern_path: str,
+    *,
+    confidence: float,
+    timeout: float,
+    edge_match: bool = False,
+) -> dict | None:
+    """Wait for one in-memory pattern match until a bounded deadline."""
+    if timeout <= 0:
+        raise ValueError("Pattern timeout must be greater than zero")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        matches = scan_pattern_matches(
+            window_bounds,
+            pattern_path,
+            confidence,
+            edge_match=edge_match,
+        )
+        if matches:
+            return matches[0]
+        cancellable_sleep(0.08)
+    return None
 
 
 def scroll_browser_down(
@@ -780,6 +823,78 @@ def wait_for_result_notification(
         "colour": colour,
         "red_score": red_score,
         "changed_ratio": changed_ratio,
+    }
+
+
+def wait_and_dismiss_notification(
+    window_bounds: tuple[int, int, int, int],
+    expected_pattern_path: str,
+    fallback_baseline,
+    fallback_rectangle: tuple[int, int, int, int],
+    *,
+    pattern_confidence: float,
+    edge_inset: int,
+    timeout: float,
+    settle_delay: float,
+    change_threshold: int,
+    changed_ratio_threshold: float,
+    red_score_threshold: float,
+) -> dict:
+    """Dismiss an expected toast by edges, with colour-change fallback."""
+    if edge_inset < 0:
+        raise ValueError("notification_pattern_edge_inset cannot be negative")
+    match = wait_for_pattern(
+        window_bounds,
+        expected_pattern_path,
+        confidence=pattern_confidence,
+        timeout=timeout,
+        edge_match=True,
+    )
+    if match is not None:
+        click_x, click_y = random_pattern_point(
+            match,
+            edge_inset,
+            configured_path(expected_pattern_path).name,
+        )
+        move_pointer_to(click_x, click_y)
+        click_left_button()
+        return {
+            "colour": "green",
+            "red_score": 0.0,
+            "changed_ratio": 0.0,
+            "x": click_x,
+            "y": click_y,
+            "source": "edge pattern",
+            "confidence": float(match["confidence"]),
+            "pattern": configured_path(expected_pattern_path).name,
+        }
+
+    notification = wait_for_result_notification(
+        fallback_baseline,
+        fallback_rectangle,
+        timeout=timeout,
+        settle_delay=settle_delay,
+        change_threshold=change_threshold,
+        changed_ratio_threshold=changed_ratio_threshold,
+        red_score_threshold=red_score_threshold,
+    )
+    minimum_x = fallback_rectangle[0] + edge_inset
+    maximum_x = fallback_rectangle[2] - 1 - edge_inset
+    minimum_y = fallback_rectangle[1] + edge_inset
+    maximum_y = fallback_rectangle[3] - 1 - edge_inset
+    if maximum_x < minimum_x or maximum_y < minimum_y:
+        raise ValueError("Notification click rectangle is too small for its inset")
+    click_x = truncated_normal_pixel(minimum_x, maximum_x)
+    click_y = truncated_normal_pixel(minimum_y, maximum_y)
+    move_pointer_to(click_x, click_y)
+    click_left_button()
+    return {
+        **notification,
+        "x": click_x,
+        "y": click_y,
+        "source": "colour-change fallback",
+        "confidence": 0.0,
+        "pattern": configured_path(expected_pattern_path).name,
     }
 
 
@@ -1054,6 +1169,10 @@ def confirm_checkbox_and_mark_action(
     scroll_distance: int,
     scroll_attempts: int,
     scroll_settle_delay: float,
+    order_is_sent_notification_pattern_path: str,
+    complete_notification_pattern_path: str,
+    notification_pattern_confidence: float,
+    notification_pattern_edge_inset: int,
     notification_top_min: int,
     notification_top_max: int,
     notification_right_min: int,
@@ -1085,10 +1204,34 @@ def confirm_checkbox_and_mark_action(
             f"Checkbox target is outside Chrome: ({checkbox_x}, {checkbox_y})"
         )
 
+    notification_bounds = notification_rectangle(
+        top_min=notification_top_min,
+        top_max=notification_top_max,
+        right_min=notification_right_min,
+        right_max=notification_right_max,
+    )
+    sent_notification_baseline = capture_screen_rectangle(notification_bounds)
     move_pointer_to(checkbox_x, checkbox_y)
     click_left_button()
     interaction_delay("enter_delay")
     press_enter()
+    sent_notification = wait_and_dismiss_notification(
+        window_bounds,
+        order_is_sent_notification_pattern_path,
+        sent_notification_baseline,
+        notification_bounds,
+        pattern_confidence=notification_pattern_confidence,
+        edge_inset=notification_pattern_edge_inset,
+        timeout=notification_timeout,
+        settle_delay=notification_settle_delay,
+        change_threshold=notification_change_threshold,
+        changed_ratio_threshold=notification_changed_ratio,
+        red_score_threshold=notification_red_score_threshold,
+    )
+    if sent_notification["colour"] == "red":
+        press_f5()
+        cancellable_sleep(red_refresh_wait)
+        raise RuntimeError("Is Sent confirmation returned a red notification")
 
     dropdown_matches = scan_pattern_matches(
         window_bounds,
@@ -1133,36 +1276,26 @@ def confirm_checkbox_and_mark_action(
     )
     move_pointer_to(action_x, action_y)
 
-    notification_bounds = notification_rectangle(
-        top_min=notification_top_min,
-        top_max=notification_top_max,
-        right_min=notification_right_min,
-        right_max=notification_right_max,
+    complete_notification_baseline = capture_screen_rectangle(
+        notification_bounds
     )
-    notification_baseline = capture_screen_rectangle(notification_bounds)
 
     click_left_button()
     interaction_delay("enter_delay")
     press_enter()
-    notification = wait_for_result_notification(
-        notification_baseline,
+    notification = wait_and_dismiss_notification(
+        window_bounds,
+        complete_notification_pattern_path,
+        complete_notification_baseline,
         notification_bounds,
+        pattern_confidence=notification_pattern_confidence,
+        edge_inset=notification_pattern_edge_inset,
         timeout=notification_timeout,
         settle_delay=notification_settle_delay,
         change_threshold=notification_change_threshold,
         changed_ratio_threshold=notification_changed_ratio,
         red_score_threshold=notification_red_score_threshold,
     )
-    notification_x = truncated_normal_pixel(
-        notification_bounds[0],
-        notification_bounds[2] - 1,
-    )
-    notification_y = truncated_normal_pixel(
-        notification_bounds[1],
-        notification_bounds[3] - 1,
-    )
-    move_pointer_to(notification_x, notification_y)
-    click_left_button()
 
     refreshed = notification["colour"] == "red"
     if refreshed:
@@ -1181,8 +1314,16 @@ def confirm_checkbox_and_mark_action(
         "notification_colour": notification["colour"],
         "notification_red_score": notification["red_score"],
         "notification_changed_ratio": notification["changed_ratio"],
-        "notification_x": notification_x,
-        "notification_y": notification_y,
+        "notification_x": notification["x"],
+        "notification_y": notification["y"],
+        "notification_source": notification["source"],
+        "notification_confidence": notification["confidence"],
+        "notification_pattern": notification["pattern"],
+        "sent_notification_x": sent_notification["x"],
+        "sent_notification_y": sent_notification["y"],
+        "sent_notification_source": sent_notification["source"],
+        "sent_notification_confidence": sent_notification["confidence"],
+        "sent_notification_pattern": sent_notification["pattern"],
         "page_refreshed": refreshed,
         "checkbox_scroll_count": int(
             dropdown_state.get("checkbox_scroll_count", 0)
