@@ -82,26 +82,29 @@ from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "Admin_settings.json"
-CURRENT_VERSION = "3.18"
-VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/version.txt"
-PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/Admin.py"
-READ_PUSH_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/ReadPush.py"
-FINISH_ORDERS_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/FinishOrders.py"
-PATTERN_URL = "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/pattern.png"
+CURRENT_VERSION = "3.19"
+RAW_REPOSITORY_URL = (
+    "https://raw.githubusercontent.com/GreenPo-cloud/Admin/refs/heads/main"
+)
+VERSION_URL = f"{RAW_REPOSITORY_URL}/version.txt"
+PYTHON_URL = f"{RAW_REPOSITORY_URL}/Admin.py"
+READ_PUSH_URL = f"{RAW_REPOSITORY_URL}/ReadPush.py"
+FINISH_ORDERS_URL = f"{RAW_REPOSITORY_URL}/FinishOrders.py"
+PATTERN_URL = f"{RAW_REPOSITORY_URL}/pattern.png"
 CHECKBOX_PATTERN_URL = (
-    "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/checkbox.png"
+    f"{RAW_REPOSITORY_URL}/checkbox.png"
 )
 SENT_PENDING_PATTERN_URL = (
-    "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/sent%26pending.png"
+    f"{RAW_REPOSITORY_URL}/sent%26pending.png"
 )
 SENT_PAID_PATTERN_URL = (
-    "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/sent%26paid.png"
+    f"{RAW_REPOSITORY_URL}/sent%26paid.png"
 )
 ORDER_IS_SENT_PATTERN_URL = (
-    "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/OrderIsSent.png"
+    f"{RAW_REPOSITORY_URL}/OrderIsSent.png"
 )
 COMPLETE_PATTERN_URL = (
-    "https://raw.githubusercontent.com/GreenPo-cloud/Admin/main/Complete.png"
+    f"{RAW_REPOSITORY_URL}/Complete.png"
 )
 MUTEX_NAME = "GreenPoAdminProgramMutex"
 
@@ -118,6 +121,13 @@ class FinishOrderValidationError(RuntimeError):
 STATISTICS_ANY_ORDER_PATTERN = re.compile(r"(?<!\S)#\d+(?=\s|$)")
 UPS_TRACKING_PATTERN = re.compile(r"^1ZR", re.IGNORECASE)
 PACKETA_TRACKING_PATTERN = re.compile(r"^Z\d{5,}(?=\s|$)", re.IGNORECASE)
+STATISTICS_DELIVERY_ALIASES = {
+    "ups": "UPS",
+    "zasilkovna": "Packeta",
+    "zásilkovna": "Packeta",
+    "packeta": "Packeta",
+    "postal": "Postal",
+}
 CHANGE_LABEL_SOURCE_PATTERN = re.compile(
     r"^change\s+(\d+(?:\s*,\s*\d+)*)\.pdf$",
     re.IGNORECASE,
@@ -380,6 +390,47 @@ def statistics_order_suffix(text: str, order_id: str) -> str | None:
     return text[match.end():] if match is not None else None
 
 
+def statistics_prefix_fields(
+    text: str,
+    order_match: re.Match[str] | None = None,
+) -> tuple[str | None, str, str]:
+    """Return delivery, tracking number and customer from a statistics line.
+
+    New lines begin with an explicit delivery field. Legacy lines begin with
+    the tracking number (UPS/Packeta) or indentation (Postal), so both formats
+    remain readable.
+    """
+    order_match = order_match or STATISTICS_ANY_ORDER_PATTERN.search(text)
+    if order_match is None:
+        return None, "", ""
+
+    prefix = text[:order_match.start()]
+    values = prefix.split()
+    delivery = (
+        STATISTICS_DELIVERY_ALIASES.get(values[0].casefold())
+        if values else None
+    )
+    if delivery is not None:
+        values = values[1:]
+
+    tracking_number = ""
+    if values and (
+        UPS_TRACKING_PATTERN.match(values[0])
+        or PACKETA_TRACKING_PATTERN.match(values[0])
+    ):
+        tracking_number = values.pop(0)
+
+    if delivery is None:
+        if UPS_TRACKING_PATTERN.match(tracking_number):
+            delivery = "UPS"
+        elif PACKETA_TRACKING_PATTERN.match(tracking_number):
+            delivery = "Packeta"
+        elif prefix[:1].isspace():
+            delivery = "Postal"
+
+    return delivery, tracking_number, " ".join(values)
+
+
 def statistics_order_progress(status_suffix: str) -> tuple[bool, bool]:
     """Return assembled/packed flags from text following an order number."""
     change_markers = list(
@@ -450,16 +501,9 @@ def statistics_order_location_text(
 
 
 def statistics_delivery_type(text: str) -> str | None:
-    """Classify one statistics order line by its tracking-number field."""
-    if STATISTICS_ANY_ORDER_PATTERN.search(text) is None:
-        return None
-    if UPS_TRACKING_PATTERN.match(text):
-        return "UPS"
-    if PACKETA_TRACKING_PATTERN.match(text):
-        return "Packeta"
-    if text[:1].isspace():
-        return "Postal"
-    return None
+    """Classify a new or legacy statistics order line."""
+    delivery, _tracking_number, _customer_name = statistics_prefix_fields(text)
+    return delivery
 
 
 def check_for_updates() -> None:
@@ -467,10 +511,16 @@ def check_for_updates() -> None:
     try:
         response = requests.get(VERSION_URL, timeout=5)
         response.raise_for_status()
-        latest = response.text.strip()
+        latest = response.content.decode("utf-8-sig").strip()
         current_key = version_key(CURRENT_VERSION)
         latest_key = version_key(latest)
-        if not current_key or not latest_key or latest_key <= current_key:
+        if not current_key:
+            print(f"! Invalid local Admin version: {CURRENT_VERSION!r}")
+            return
+        if not latest_key:
+            print(f"! Invalid version received from GitHub: {latest!r}")
+            return
+        if latest_key <= current_key:
             print(f"* Admin {CURRENT_VERSION} is up to date")
             return
 
@@ -906,15 +956,10 @@ class AdminApp:
                 f"Order {requested_order} was not found in Part {part_number}"
             )
 
-        prefix = order_line[: order_match.start()].strip()
-        tracking_and_customer = prefix.split(maxsplit=1)
-        if prefix.casefold().startswith("1zr") or PACKETA_TRACKING_PATTERN.match(prefix):
-            customer_name = (
-                tracking_and_customer[1] if len(tracking_and_customer) == 2 else ""
-            )
-        else:
-            customer_name = prefix
-        customer_name = " ".join(customer_name.split())
+        _delivery, _tracking_number, customer_name = statistics_prefix_fields(
+            order_line,
+            order_match,
+        )
         if not customer_name:
             raise FinishOrderValidationError(
                 f"CustomerName is empty for {requested_order} in statistics"
