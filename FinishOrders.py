@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import html as html_module
 import json
 import os
 import random
@@ -851,6 +852,26 @@ def wait_and_dismiss_notification(
         edge_match=True,
     )
     if match is not None:
+        # Toasts slide in from the right. The first detected position can be
+        # stale by the time the pointer arrives, so click a fresh settled match.
+        if settle_delay:
+            cancellable_sleep(settle_delay)
+            settled_matches = scan_pattern_matches(
+                window_bounds,
+                expected_pattern_path,
+                pattern_confidence,
+                edge_match=True,
+            )
+            if settled_matches:
+                original_center_x = int(match["center_x"])
+                original_center_y = int(match["center_y"])
+                match = min(
+                    settled_matches,
+                    key=lambda item: (
+                        (int(item["center_x"]) - original_center_x) ** 2
+                        + (int(item["center_y"]) - original_center_y) ** 2
+                    ),
+                )
         click_x, click_y = random_pattern_point(
             match,
             edge_inset,
@@ -982,10 +1003,20 @@ def read_clipboard() -> tuple[str, str, list[str]]:
         USER32.CloseClipboard()
 
 
-PRICE_PATTERN = re.compile(
-    r"(?<![\d.,])\d{1,3}(?:[ \u00a0]\d{3})*(?:[.,]\d{2})\s*€",
+PRICE_AMOUNT_PATTERN = re.compile(
+    r"(?<![\d.,])(?:\d{1,3}(?:[ \u00a0]\d{3})+|\d+)[.,]\d{2}(?!\d)",
     re.IGNORECASE,
 )
+PRICE_CURRENCY_PATTERN = re.compile(
+    PRICE_AMOUNT_PATTERN.pattern
+    + r"(?:\s*(?:€|EUR|Kč|CZK|\$|USD|£|GBP|zł|PLN|CHF|Ft|HUF))?",
+    re.IGNORECASE,
+)
+HTML_TABLE_CELL_PATTERN = re.compile(
+    r"<td\b(?P<attributes>[^>]*)>(?P<body>.*?)</td\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+HTML_TAG_PATTERN = re.compile(r"<[^>]+>", re.DOTALL)
 
 
 def classify_css_colour(value: str) -> str:
@@ -1010,9 +1041,50 @@ def classify_css_colour(value: str) -> str:
 
 
 def detect_price_and_colour(plain_text: str, html: str) -> tuple[str, str, str]:
-    """Extract the copied euro price and its nearest HTML colour marker."""
-    text_price = PRICE_PATTERN.search(plain_text)
-    html_prices = list(PRICE_PATTERN.finditer(html))
+    """Extract the order price and colour from its semantic HTML table cell."""
+    for cell in reversed(list(HTML_TABLE_CELL_PATTERN.finditer(html))):
+        attributes = cell.group("attributes")
+        class_match = re.search(
+            r"\bclass\s*=\s*(['\"])(.*?)\1",
+            attributes,
+            re.IGNORECASE | re.DOTALL,
+        )
+        classes = class_match.group(2).casefold() if class_match else ""
+        class_names = classes.split()
+        if "col-status" not in class_names:
+            continue
+
+        cell_text = html_module.unescape(
+            HTML_TAG_PATTERN.sub(" ", cell.group("body"))
+        )
+        cell_prices = list(PRICE_CURRENCY_PATTERN.finditer(cell_text))
+        price = (
+            " ".join(cell_prices[-1].group(0).split())
+            if cell_prices else ""
+        )
+        if "text-success" in class_names:
+            return price, "green", "order price cell class: text-success"
+        if "text-danger" in class_names:
+            return price, "red", "order price cell class: text-danger"
+
+        css_colours = list(
+            re.finditer(
+                r"color\s*:\s*(#[0-9a-f]{3,8}|rgba?\([^)]*\)|[a-z]+)",
+                attributes,
+                re.IGNORECASE,
+            )
+        )
+        if css_colours:
+            raw_colour = css_colours[-1].group(1)
+            return (
+                price,
+                classify_css_colour(raw_colour),
+                f"order price cell CSS colour: {raw_colour}",
+            )
+
+    text_prices = list(PRICE_CURRENCY_PATTERN.finditer(plain_text))
+    html_prices = list(PRICE_CURRENCY_PATTERN.finditer(html))
+    text_price = text_prices[-1] if text_prices else None
     price = " ".join(text_price.group(0).split()) if text_price else ""
     if not price and html_prices:
         price = " ".join(html_prices[-1].group(0).split())

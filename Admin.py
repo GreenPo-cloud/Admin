@@ -82,7 +82,7 @@ from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "Admin_settings.json"
-CURRENT_VERSION = "3.19"
+CURRENT_VERSION = "3.20"
 RAW_REPOSITORY_URL = (
     "https://raw.githubusercontent.com/GreenPo-cloud/Admin/refs/heads/main"
 )
@@ -215,8 +215,11 @@ SETTINGS_DEFAULTS = {
         "click_delay_min": 0.2,
         "click_delay_max": 1.0,
         "click_delay_scale": 0.5,
+        "mouse_click_timing_scale": 0.5,
         "enter_delay_min": 0.0,
         "enter_delay_max": 1.0,
+        "statistics_read_retries": 3,
+        "statistics_read_retry_delay": 0.5,
         "notification_top_min": 140,
         "notification_top_max": 170,
         "notification_right_min": 50,
@@ -909,6 +912,42 @@ class AdminApp:
     def normalized_customer_name(value: str) -> str:
         return " ".join(value.split()).casefold()
 
+    def read_finish_statistics(self, statistics_path: Path) -> list[str]:
+        """Read shared statistics with bounded retries for transient SMB locks."""
+        configuration = self.settings.get("FINISH_ORDERS", {})
+        retries = int(configuration.get("statistics_read_retries", 3))
+        attempts = retries + 1
+        retry_delay = float(
+            configuration.get("statistics_read_retry_delay", 0.5)
+        )
+        if retries < 0:
+            raise ValueError("statistics_read_retries cannot be negative")
+        if retry_delay < 0:
+            raise ValueError("statistics_read_retry_delay cannot be negative")
+
+        for attempt in range(1, attempts + 1):
+            try:
+                return statistics_path.read_text(
+                    encoding="utf-8-sig"
+                ).splitlines()
+            except OSError as error:
+                if attempt >= attempts:
+                    raise RuntimeError(
+                        f"Cannot read finish statistics {statistics_path} "
+                        f"after {attempts} attempts: {error}"
+                    ) from error
+                print(
+                    f"! Finish statistics is temporarily unavailable "
+                    f"(attempt {attempt}/{attempts}); retrying in "
+                    f"{retry_delay:g} seconds"
+                )
+                if self.finish_orders_cancel_event.wait(retry_delay):
+                    raise RuntimeError(
+                        "Statistics read cancelled by Space"
+                    ) from error
+
+        raise RuntimeError("Statistics read failed unexpectedly")
+
     def validate_finish_order(
         self,
         clipboard_text: str,
@@ -916,12 +955,7 @@ class AdminApp:
     ) -> dict:
         """Validate one website row against today's network statistics."""
         statistics_path = self.statistics_path()
-        try:
-            lines = statistics_path.read_text(encoding="utf-8-sig").splitlines()
-        except OSError as error:
-            raise RuntimeError(
-                f"Cannot read finish statistics {statistics_path}: {error}"
-            ) from error
+        lines = self.read_finish_statistics(statistics_path)
 
         order_number = self.clipboard_order_number(clipboard_text)
         requested_order = f"#{order_number}"
@@ -1012,19 +1046,24 @@ class AdminApp:
             )
             if mouse_speed_multiplier <= 0:
                 raise ValueError("mouse_speed_multiplier must be greater than zero")
+            mouse_click_timing_scale = float(
+                configuration.get("mouse_click_timing_scale", 0.5)
+            )
+            if mouse_click_timing_scale < 0:
+                raise ValueError("mouse_click_timing_scale cannot be negative")
             configure_interaction_timing(
                 mouse_move_min=float(
                     configuration.get("mouse_move_duration_min", 0.25)
-                ) / mouse_speed_multiplier,
+                ) / mouse_speed_multiplier * mouse_click_timing_scale,
                 mouse_move_max=float(
                     configuration.get("mouse_move_duration_max", 0.75)
-                ) / mouse_speed_multiplier,
+                ) / mouse_speed_multiplier * mouse_click_timing_scale,
                 click_delay_min=float(
                     configuration.get("click_delay_min", 0.2)
-                ) * click_delay_scale,
+                ) * click_delay_scale * mouse_click_timing_scale,
                 click_delay_max=float(
                     configuration.get("click_delay_max", 1.0)
-                ) * click_delay_scale,
+                ) * click_delay_scale * mouse_click_timing_scale,
                 enter_delay_min=float(
                     configuration.get("enter_delay_min", 0.0)
                 ),
@@ -1074,7 +1113,7 @@ class AdminApp:
                     drag_distance=drag_distance,
                     drag_duration=float(
                         configuration.get("selection_drag_duration", 0.8)
-                    ) / mouse_speed_multiplier,
+                    ) / mouse_speed_multiplier * mouse_click_timing_scale,
                 )
                 print(
                     f"* Selection: ({clipboard['start_x']}, "
